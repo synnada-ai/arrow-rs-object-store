@@ -31,7 +31,9 @@ github:
     - object-store
   enabled_merge_buttons:
     squash: true
-    merge: false
+    #merge: false
+    # enable merge temporarily to preserve imported history
+    merge: true
     rebase: false
   features:
     issues: true
