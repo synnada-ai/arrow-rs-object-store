@@ -603,6 +603,7 @@ impl AzureClient {
             tags,
             attributes,
             extensions,
+            ..
         } = opts;
 
         let blocks = parts

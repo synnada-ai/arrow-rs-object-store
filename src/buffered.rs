@@ -402,6 +402,7 @@ impl AsyncWrite for BufWriter {
         let cap = self.capacity;
         let max_concurrency = self.max_concurrency;
         loop {
+            let actual_flush = self.actual_flush;
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
                     ready!(write.poll_for_capacity(cx, max_concurrency))?;
@@ -427,7 +428,7 @@ impl AsyncWrite for BufWriter {
                             attributes: self.attributes.clone().take().unwrap_or_default(),
                             tags: self.tags.clone().take().unwrap_or_default(),
                             extensions: self.extensions.clone().take().unwrap_or_default(),
-                            copy_and_append: true,
+                            copy_and_append: if actual_flush { true } else { false },
                         };
                         let store = Arc::clone(&self.store);
                         self.state = BufWriterState::Prepare(Box::pin(async move {
