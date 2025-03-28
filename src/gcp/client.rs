@@ -458,6 +458,7 @@ impl GoogleCloudStorageClient {
             tags: _,
             attributes,
             extensions,
+            ..
         } = opts;
 
         let response = self
