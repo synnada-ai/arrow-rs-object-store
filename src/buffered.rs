@@ -465,7 +465,6 @@ impl AsyncWrite for BufWriter {
                 };
             }
 
-
             match &mut self.state {
                 BufWriterState::Prepare(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
@@ -507,9 +506,7 @@ impl AsyncWrite for BufWriter {
                             Ok(WriteMultipart::new_with_chunk_size(upload, cap))
                         }));
                     } else {
-
                     }
-
                 }
                 BufWriterState::Write(x) => {
                     if x.is_none() {
@@ -793,7 +790,8 @@ mod tests {
         let path = format!("{}/{table_path}", cwd.to_string_lossy());
         let location = Path::parse(&path).unwrap();
 
-        let buf_writer = BufWriter::with_capacity(Arc::clone(&object_store), location, 3).with_actual_flush(true);
+        let buf_writer = BufWriter::with_capacity(Arc::clone(&object_store), location, 3)
+            .with_actual_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
 
         let bytes = b"abc";
