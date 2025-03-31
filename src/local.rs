@@ -377,7 +377,11 @@ impl ObjectStore for LocalFileSystem {
 
         let path = self.path_to_filesystem(location)?;
         maybe_spawn_blocking(move || {
-            let (mut file, staging_path) = new_staged_upload(&path)?;
+            let (mut file, staging_path) = if opts.copy_and_append {
+                new_staged_upload_copy_and_append_from(&path)?
+            } else {
+                new_staged_upload(&path)?
+            };
             let mut e_tag = None;
 
             let err = match payload.iter().try_for_each(|x| file.write_all(x)) {

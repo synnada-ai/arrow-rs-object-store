@@ -1148,6 +1148,8 @@ pub struct PutOptions {
     ///
     /// Implementations that don't support an attribute should return an error
     pub attributes: Attributes,
+    /// Copy file and append from it
+    pub copy_and_append: bool,
 }
 
 impl From<PutMode> for PutOptions {
