@@ -530,6 +530,7 @@ impl AsyncWrite for BufWriter {
                     let opts = PutOptions {
                         attributes: self.attributes.take().unwrap_or_default(),
                         tags: self.tags.take().unwrap_or_default(),
+                        copy_and_append: true,
                         ..Default::default()
                     };
                     let store = Arc::clone(&self.store);
@@ -803,11 +804,19 @@ mod tests {
         assert_eq!(contents, "abcabcabcdefdef");
 
         let meta = object_store.head(&location).await.unwrap();
-        let mut reader = BufReader::new(object_store, &meta);
+        let mut reader = BufReader::new(Arc::clone(&object_store), &meta);
         let mut bytes = Vec::with_capacity(4096);
         let n = reader.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(n, 15);
 
+        let buf_writer =
+            BufWriter::new(Arc::clone(&object_store), location.clone()).with_actual_flush(true);
+        let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
+        let bytes = b"zzzz";
+        writer.write_all(bytes).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let contents = read_file_contents(&path).unwrap();
+        assert_eq!(contents, "abcabcabcdefdefzzzz");
         // Clean up test file
         if let Err(e) = std::fs::remove_file(&path) {
             panic!("Failed to delete file {}: {}", path, e);
