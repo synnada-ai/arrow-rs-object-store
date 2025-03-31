@@ -1188,6 +1188,8 @@ pub struct PutMultipartOpts {
     ///
     /// Implementations that don't support an attribute should return an error
     pub attributes: Attributes,
+    /// Copy file and append from it
+    pub copy_and_append: bool,
 }
 
 impl From<TagSet> for PutMultipartOpts {
