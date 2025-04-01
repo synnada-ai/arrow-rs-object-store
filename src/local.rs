@@ -765,23 +765,27 @@ fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(Fil
         let suffix = multipart_id.to_string();
         let path = staged_upload_path(base, &suffix);
 
-        if base.exists() {
+        let offset = if base.exists() {
+            let offset = std::fs::metadata(base).unwrap().len();
+
             std::fs::copy(base, &path).map_err(|source| Error::UnableToCopyFile {
                 from: base.to_path_buf(),
                 to: path.clone(),
                 source,
             })?;
-        }
+
+            offset
+        } else {
+            0
+        };
 
         let mut options = OpenOptions::new();
-        match options
-            .read(true)
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            Ok(f) => return Ok((f, path)),
+        match options.read(true).write(true).create(true).open(&path) {
+            Ok(mut f) => {
+                let _ = f.seek(SeekFrom::Start(offset)).unwrap();
+
+                return Ok((f, path));
+            }
             Err(source) => match source.kind() {
                 ErrorKind::AlreadyExists => unreachable!(""),
                 ErrorKind::NotFound => create_parent_dirs(&path, source)?,

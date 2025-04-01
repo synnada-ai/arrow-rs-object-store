@@ -823,6 +823,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_values_in_order() {
+        let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
+        let cwd = std::env::current_dir().unwrap();
+        let table_path = "target/tests/test2.json";
+        let path = format!("{}/{table_path}", cwd.to_string_lossy());
+        let location = Path::parse(&path).unwrap();
+
+        let buf_writer = BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 3)
+            .with_actual_flush(true);
+        let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
+
+        let bytes = b"1\n2\n3\n4\n5\n";
+        writer.write_all(bytes).await.unwrap();
+        writer.flush().await.unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        let contents = read_file_contents(&path).unwrap();
+        assert_eq!(contents, "1\n2\n3\n4\n5\n");
+
+        writer.shutdown().await.unwrap();
+        // Clean up test file
+        if let Err(e) = std::fs::remove_file(&path) {
+            panic!("Failed to delete file {}: {}", path, e);
+        }
+    }
+
     fn read_file_contents(path: &str) -> std::io::Result<String> {
         let file = File::open(path)?;
         let mut reader = std::io::BufReader::new(file);
