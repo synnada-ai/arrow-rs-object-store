@@ -378,7 +378,8 @@ impl ObjectStore for LocalFileSystem {
         let path = self.path_to_filesystem(location)?;
         maybe_spawn_blocking(move || {
             let (mut file, staging_path) = if opts.copy_and_append {
-                new_staged_upload_copy_and_append_from(&path)?
+                let (file, staging_path, _offset) = new_staged_upload_copy_and_append_from(&path)?;
+                (file, staging_path)
             } else {
                 new_staged_upload(&path)?
             };
@@ -443,12 +444,13 @@ impl ObjectStore for LocalFileSystem {
         }
 
         let dest = self.path_to_filesystem(location)?;
-        let (file, src) = if opts.copy_and_append {
+        let (file, src, offset) = if opts.copy_and_append {
             new_staged_upload_copy_and_append_from(&dest)?
         } else {
-            new_staged_upload(&dest)?
+            let (file, src) = new_staged_upload(&dest)?;
+            (file, src, 0)
         };
-        Ok(Box::new(LocalUpload::new(src, dest, file)))
+        Ok(Box::new(LocalUpload::new(src, dest, file, offset)))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -759,7 +761,7 @@ fn new_staged_upload(base: &std::path::Path) -> Result<(File, PathBuf)> {
     }
 }
 
-fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(File, PathBuf)> {
+fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(File, PathBuf, u64)> {
     let multipart_id = 1;
     loop {
         let suffix = multipart_id.to_string();
@@ -784,7 +786,7 @@ fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(Fil
             Ok(mut f) => {
                 let _ = f.seek(SeekFrom::Start(offset)).unwrap();
 
-                return Ok((f, path));
+                return Ok((f, path, offset));
             }
             Err(source) => match source.kind() {
                 ErrorKind::AlreadyExists => unreachable!(""),
@@ -820,14 +822,14 @@ struct UploadState {
 }
 
 impl LocalUpload {
-    pub fn new(src: PathBuf, dest: PathBuf, file: File) -> Self {
+    pub fn new(src: PathBuf, dest: PathBuf, file: File, offset: u64) -> Self {
         Self {
             state: Arc::new(UploadState {
                 dest,
                 file: Mutex::new(file),
             }),
             src: Some(src),
-            offset: 0,
+            offset,
         }
     }
 }

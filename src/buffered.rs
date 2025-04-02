@@ -831,11 +831,15 @@ mod tests {
         let path = format!("{}/{table_path}", cwd.to_string_lossy());
         let location = Path::parse(&path).unwrap();
 
-        let buf_writer = BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 3)
-            .with_actual_flush(true);
+        let buf_writer =
+            BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 1024)
+                .with_actual_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
 
-        let bytes = b"1\n2\n3\n4\n5\n";
+        let bytes = b"1\n2\n3\n";
+        writer.write_all(bytes).await.unwrap();
+        writer.flush().await.unwrap();
+        let bytes = b"4\n5\n";
         writer.write_all(bytes).await.unwrap();
         writer.flush().await.unwrap();
         assert!(std::path::Path::new(&path).exists());
