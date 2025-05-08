@@ -333,7 +333,12 @@ impl ObjectStore for LocalFileSystem {
 
         let path = self.path_to_filesystem(location)?;
         maybe_spawn_blocking(move || {
-            let (mut file, staging_path) = new_staged_upload(&path)?;
+            let (mut file, staging_path) = if opts.copy_and_append {
+                let (file, staging_path, _offset) = new_staged_upload_copy_and_append_from(&path)?;
+                (file, staging_path)
+            } else {
+                new_staged_upload(&path)?
+            };
             let mut e_tag = None;
 
             let err = match payload.iter().try_for_each(|x| file.write_all(x)) {
@@ -395,8 +400,13 @@ impl ObjectStore for LocalFileSystem {
         }
 
         let dest = self.path_to_filesystem(location)?;
-        let (file, src) = new_staged_upload(&dest)?;
-        Ok(Box::new(LocalUpload::new(src, dest, file)))
+        let (file, src, offset) = if opts.copy_and_append {
+            new_staged_upload_copy_and_append_from(&dest)?
+        } else {
+            let (file, src) = new_staged_upload(&dest)?;
+            (file, src, 0)
+        };
+        Ok(Box::new(LocalUpload::new(src, dest, file, offset)))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -743,6 +753,42 @@ fn new_staged_upload(base: &std::path::Path) -> Result<(File, PathBuf)> {
     }
 }
 
+fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(File, PathBuf, u64)> {
+    let multipart_id = 1;
+    loop {
+        let suffix = multipart_id.to_string();
+        let path = staged_upload_path(base, &suffix);
+
+        let offset = if base.exists() {
+            let offset = std::fs::metadata(base).unwrap().len();
+
+            std::fs::copy(base, &path).map_err(|source| Error::UnableToCopyFile {
+                from: base.to_path_buf(),
+                to: path.clone(),
+                source,
+            })?;
+
+            offset
+        } else {
+            0
+        };
+
+        let mut options = OpenOptions::new();
+        match options.read(true).write(true).create(true).open(&path) {
+            Ok(mut f) => {
+                let _ = f.seek(SeekFrom::Start(offset)).unwrap();
+
+                return Ok((f, path, offset));
+            }
+            Err(source) => match source.kind() {
+                ErrorKind::AlreadyExists => unreachable!(""),
+                ErrorKind::NotFound => create_parent_dirs(&path, source)?,
+                _ => return Err(Error::UnableToOpenFile { source, path }.into()),
+            },
+        }
+    }
+}
+
 /// Returns the unique upload for the given path and suffix
 fn staged_upload_path(dest: &std::path::Path, suffix: &str) -> PathBuf {
     let mut staging_path = dest.as_os_str().to_owned();
@@ -768,14 +814,14 @@ struct UploadState {
 }
 
 impl LocalUpload {
-    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File) -> Self {
+    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File, offset: u64) -> Self {
         Self {
             state: Arc::new(UploadState {
                 dest,
                 file: Mutex::new(file),
             }),
             src: Some(src),
-            offset: 0,
+            offset,
         }
     }
 }

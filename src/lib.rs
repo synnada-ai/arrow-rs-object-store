@@ -1167,6 +1167,8 @@ pub struct PutOptions {
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
     pub extensions: ::http::Extensions,
+    /// Copy file and append from it
+    pub copy_and_append: bool,
 }
 
 impl PartialEq<Self> for PutOptions {
@@ -1175,15 +1177,15 @@ impl PartialEq<Self> for PutOptions {
             mode,
             tags,
             attributes,
-            extensions: _,
+            extensions: _, copy_and_append,
         } = self;
         let Self {
             mode: other_mode,
             tags: other_tags,
             attributes: other_attributes,
-            extensions: _,
+            extensions: _, copy_and_append: other_copy_and_append,
         } = other;
-        (mode == other_mode) && (tags == other_tags) && (attributes == other_attributes)
+        (mode == other_mode) && (tags == other_tags) && (attributes == other_attributes)&& (copy_and_append == other_copy_and_append)
     }
 }
 
@@ -1234,6 +1236,8 @@ pub struct PutMultipartOpts {
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
     pub extensions: ::http::Extensions,
+    /// Copy file and append from it
+    pub copy_and_append: bool,
 }
 
 impl PartialEq<Self> for PutMultipartOpts {
@@ -1241,14 +1245,14 @@ impl PartialEq<Self> for PutMultipartOpts {
         let Self {
             tags,
             attributes,
-            extensions: _,
+            extensions: _, copy_and_append,
         } = self;
         let Self {
             tags: other_tags,
             attributes: other_attributes,
-            extensions: _,
+            extensions: _,copy_and_append: other_copy_and_append
         } = other;
-        (tags == other_tags) && (attributes == other_attributes)
+        (tags == other_tags) && (attributes == other_attributes)&&(copy_and_append == other_copy_and_append)
     }
 }
 
