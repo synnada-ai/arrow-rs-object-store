@@ -18,56 +18,55 @@
 use crate::client::get::GetClient;
 use crate::client::header::HeaderConfig;
 use crate::client::retry::{self, RetryConfig, RetryExt};
-use crate::client::GetOptionsExt;
+use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::path::{Path, DELIMITER};
 use crate::util::deserialize_rfc1123;
 use crate::{Attribute, Attributes, ClientOptions, GetOptions, ObjectMeta, PutPayload, Result};
 use async_trait::async_trait;
 use bytes::Buf;
 use chrono::{DateTime, Utc};
-use hyper::header::{
+use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
     CONTENT_TYPE,
 };
 use percent_encoding::percent_decode_str;
-use reqwest::{Method, Response, StatusCode};
+use reqwest::{Method, StatusCode};
 use serde::Deserialize;
-use snafu::{OptionExt, ResultExt, Snafu};
 use url::Url;
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 enum Error {
-    #[snafu(display("Request error: {}", source))]
-    Request { source: retry::Error },
+    #[error("Request error: {}", source)]
+    Request { source: retry::RetryError },
 
-    #[snafu(display("Request error: {}", source))]
-    Reqwest { source: reqwest::Error },
+    #[error("Request error: {}", source)]
+    Reqwest { source: HttpError },
 
-    #[snafu(display("Range request not supported by {}", href))]
+    #[error("Range request not supported by {}", href)]
     RangeNotSupported { href: String },
 
-    #[snafu(display("Error decoding PROPFIND response: {}", source))]
+    #[error("Error decoding PROPFIND response: {}", source)]
     InvalidPropFind { source: quick_xml::de::DeError },
 
-    #[snafu(display("Missing content size for {}", href))]
+    #[error("Missing content size for {}", href)]
     MissingSize { href: String },
 
-    #[snafu(display("Error getting properties of \"{}\" got \"{}\"", href, status))]
+    #[error("Error getting properties of \"{}\" got \"{}\"", href, status)]
     PropStatus { href: String, status: String },
 
-    #[snafu(display("Failed to parse href \"{}\": {}", href, source))]
+    #[error("Failed to parse href \"{}\": {}", href, source)]
     InvalidHref {
         href: String,
         source: url::ParseError,
     },
 
-    #[snafu(display("Path \"{}\" contained non-unicode characters: {}", path, source))]
+    #[error("Path \"{}\" contained non-unicode characters: {}", path, source)]
     NonUnicode {
         path: String,
         source: std::str::Utf8Error,
     },
 
-    #[snafu(display("Encountered invalid path \"{}\": {}", path, source))]
+    #[error("Encountered invalid path \"{}\": {}", path, source)]
     InvalidPath {
         path: String,
         source: crate::path::Error,
@@ -85,32 +84,36 @@ impl From<Error> for crate::Error {
 
 /// Internal client for HttpStore
 #[derive(Debug)]
-pub struct Client {
+pub(crate) struct Client {
     url: Url,
-    client: reqwest::Client,
+    client: HttpClient,
     retry_config: RetryConfig,
     client_options: ClientOptions,
 }
 
 impl Client {
-    pub fn new(url: Url, client_options: ClientOptions, retry_config: RetryConfig) -> Result<Self> {
-        let client = client_options.client()?;
-        Ok(Self {
+    pub(crate) fn new(
+        url: Url,
+        client: HttpClient,
+        client_options: ClientOptions,
+        retry_config: RetryConfig,
+    ) -> Self {
+        Self {
             url,
             retry_config,
             client_options,
             client,
-        })
+        }
     }
 
-    pub fn base_url(&self) -> &Url {
+    pub(crate) fn base_url(&self) -> &Url {
         &self.url
     }
 
-    fn path_url(&self, location: &Path) -> Url {
+    fn path_url(&self, location: &Path) -> String {
         let mut url = self.url.clone();
         url.path_segments_mut().unwrap().extend(location.parts());
-        url
+        url.to_string()
     }
 
     /// Create a directory with `path` using MKCOL
@@ -122,10 +125,10 @@ impl Client {
             .extend(path.split(DELIMITER));
 
         self.client
-            .request(method, url)
+            .request(method, String::from(url))
             .send_retry(&self.retry_config)
             .await
-            .context(RequestSnafu)?;
+            .map_err(|source| Error::Request { source })?;
 
         Ok(())
     }
@@ -159,12 +162,12 @@ impl Client {
         Ok(())
     }
 
-    pub async fn put(
+    pub(crate) async fn put(
         &self,
         location: &Path,
         payload: PutPayload,
         attributes: Attributes,
-    ) -> Result<Response> {
+    ) -> Result<HttpResponse> {
         let mut retry = false;
         loop {
             let url = self.path_url(location);
@@ -216,10 +219,10 @@ impl Client {
         }
     }
 
-    pub async fn list(&self, location: Option<&Path>, depth: &str) -> Result<MultiStatus> {
+    pub(crate) async fn list(&self, location: Option<&Path>, depth: &str) -> Result<MultiStatus> {
         let url = location
             .map(|path| self.path_url(path))
-            .unwrap_or_else(|| self.url.clone());
+            .unwrap_or_else(|| self.url.to_string());
 
         let method = Method::from_bytes(b"PROPFIND").unwrap();
         let result = self
@@ -232,7 +235,11 @@ impl Client {
             .await;
 
         let response = match result {
-            Ok(result) => result.bytes().await.context(ReqwestSnafu)?,
+            Ok(result) => result
+                .into_body()
+                .bytes()
+                .await
+                .map_err(|source| Error::Reqwest { source })?,
             Err(e) if matches!(e.status(), Some(StatusCode::NOT_FOUND)) => {
                 return match depth {
                     "0" => {
@@ -251,11 +258,13 @@ impl Client {
             Err(source) => return Err(Error::Request { source }.into()),
         };
 
-        let status = quick_xml::de::from_reader(response.reader()).context(InvalidPropFindSnafu)?;
+        let status = quick_xml::de::from_reader(response.reader())
+            .map_err(|source| Error::InvalidPropFind { source })?;
+
         Ok(status)
     }
 
-    pub async fn delete(&self, path: &Path) -> Result<()> {
+    pub(crate) async fn delete(&self, path: &Path) -> Result<()> {
         let url = self.path_url(path);
         self.client
             .delete(url)
@@ -271,7 +280,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn copy(&self, from: &Path, to: &Path, overwrite: bool) -> Result<()> {
+    pub(crate) async fn copy(&self, from: &Path, to: &Path, overwrite: bool) -> Result<()> {
         let mut retry = false;
         loop {
             let method = Method::from_bytes(b"COPY").unwrap();
@@ -324,7 +333,7 @@ impl GetClient for Client {
         user_defined_metadata_prefix: None,
     };
 
-    async fn get_request(&self, path: &Path, options: GetOptions) -> Result<Response> {
+    async fn get_request(&self, path: &Path, options: GetOptions) -> Result<HttpResponse> {
         let url = self.path_url(path);
         let method = match options.head {
             true => Method::HEAD,
@@ -364,12 +373,12 @@ impl GetClient for Client {
 
 /// The response returned by a PROPFIND request, i.e. list
 #[derive(Deserialize, Default)]
-pub struct MultiStatus {
+pub(crate) struct MultiStatus {
     pub response: Vec<MultiStatusResponse>,
 }
 
 #[derive(Deserialize)]
-pub struct MultiStatusResponse {
+pub(crate) struct MultiStatusResponse {
     href: String,
     #[serde(rename = "propstat")]
     prop_stat: PropStat,
@@ -377,7 +386,7 @@ pub struct MultiStatusResponse {
 
 impl MultiStatusResponse {
     /// Returns an error if this response is not OK
-    pub fn check_ok(&self) -> Result<()> {
+    pub(crate) fn check_ok(&self) -> Result<()> {
         match self.prop_stat.status.contains("200 OK") {
             true => Ok(()),
             false => Err(Error::PropStatus {
@@ -389,31 +398,43 @@ impl MultiStatusResponse {
     }
 
     /// Returns the resolved path of this element relative to `base_url`
-    pub fn path(&self, base_url: &Url) -> Result<Path> {
+    pub(crate) fn path(&self, base_url: &Url) -> Result<Path> {
         let url = Url::options()
             .base_url(Some(base_url))
             .parse(&self.href)
-            .context(InvalidHrefSnafu { href: &self.href })?;
+            .map_err(|source| Error::InvalidHref {
+                href: self.href.clone(),
+                source,
+            })?;
 
         // Reverse any percent encoding
         let path = percent_decode_str(url.path())
             .decode_utf8()
-            .context(NonUnicodeSnafu { path: url.path() })?;
+            .map_err(|source| Error::NonUnicode {
+                path: url.path().into(),
+                source,
+            })?;
 
-        Ok(Path::parse(path.as_ref()).context(InvalidPathSnafu { path })?)
+        Ok(Path::parse(path.as_ref()).map_err(|source| {
+            let path = path.into();
+            Error::InvalidPath { path, source }
+        })?)
     }
 
-    fn size(&self) -> Result<usize> {
+    fn size(&self) -> Result<u64> {
         let size = self
             .prop_stat
             .prop
             .content_length
-            .context(MissingSizeSnafu { href: &self.href })?;
+            .ok_or_else(|| Error::MissingSize {
+                href: self.href.clone(),
+            })?;
+
         Ok(size)
     }
 
     /// Returns this objects metadata as [`ObjectMeta`]
-    pub fn object_meta(&self, base_url: &Url) -> Result<ObjectMeta> {
+    pub(crate) fn object_meta(&self, base_url: &Url) -> Result<ObjectMeta> {
         let last_modified = self.prop_stat.prop.last_modified;
         Ok(ObjectMeta {
             location: self.path(base_url)?,
@@ -425,24 +446,24 @@ impl MultiStatusResponse {
     }
 
     /// Returns true if this is a directory / collection
-    pub fn is_dir(&self) -> bool {
+    pub(crate) fn is_dir(&self) -> bool {
         self.prop_stat.prop.resource_type.collection.is_some()
     }
 }
 
 #[derive(Deserialize)]
-pub struct PropStat {
+pub(crate) struct PropStat {
     prop: Prop,
     status: String,
 }
 
 #[derive(Deserialize)]
-pub struct Prop {
+pub(crate) struct Prop {
     #[serde(deserialize_with = "deserialize_rfc1123", rename = "getlastmodified")]
     last_modified: DateTime<Utc>,
 
     #[serde(rename = "getcontentlength")]
-    content_length: Option<usize>,
+    content_length: Option<u64>,
 
     #[serde(rename = "resourcetype")]
     resource_type: ResourceType,
@@ -452,6 +473,6 @@ pub struct Prop {
 }
 
 #[derive(Deserialize)]
-pub struct ResourceType {
+pub(crate) struct ResourceType {
     collection: Option<()>,
 }

@@ -23,13 +23,15 @@ use crate::aws::{
     AmazonS3, AwsCredential, AwsCredentialProvider, Checksum, S3ConditionalPut, S3CopyIfNotExists,
     STORE,
 };
-use crate::client::TokenCredentialProvider;
+use crate::client::{http_connector, HttpConnector, TokenCredentialProvider};
 use crate::config::ConfigValue;
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use itertools::Itertools;
+use md5::{Digest, Md5};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt, Snafu};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,47 +42,46 @@ use url::Url;
 static DEFAULT_METADATA_ENDPOINT: &str = "http://169.254.169.254";
 
 /// A specialized `Error` for object store-related errors
-#[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
 enum Error {
-    #[snafu(display("Missing bucket name"))]
+    #[error("Missing bucket name")]
     MissingBucketName,
 
-    #[snafu(display("Missing AccessKeyId"))]
+    #[error("Missing AccessKeyId")]
     MissingAccessKeyId,
 
-    #[snafu(display("Missing SecretAccessKey"))]
+    #[error("Missing SecretAccessKey")]
     MissingSecretAccessKey,
 
-    #[snafu(display("Unable parse source url. Url: {}, Error: {}", url, source))]
+    #[error("Unable parse source url. Url: {}, Error: {}", url, source)]
     UnableToParseUrl {
         source: url::ParseError,
         url: String,
     },
 
-    #[snafu(display(
+    #[error(
         "Unknown url scheme cannot be parsed into storage location: {}",
         scheme
-    ))]
+    )]
     UnknownUrlScheme { scheme: String },
 
-    #[snafu(display("URL did not match any known pattern for scheme: {}", url))]
+    #[error("URL did not match any known pattern for scheme: {}", url)]
     UrlNotRecognised { url: String },
 
-    #[snafu(display("Configuration key: '{}' is not known.", key))]
+    #[error("Configuration key: '{}' is not known.", key)]
     UnknownConfigurationKey { key: String },
 
-    #[snafu(display("Invalid Zone suffix for bucket '{bucket}'"))]
+    #[error("Invalid Zone suffix for bucket '{bucket}'")]
     ZoneSuffix { bucket: String },
 
-    #[snafu(display("Invalid encryption type: {}. Valid values are \"AES256\", \"sse:kms\", and \"sse:kms:dsse\".", passed))]
+    #[error("Invalid encryption type: {}. Valid values are \"AES256\", \"sse:kms\", \"sse:kms:dsse\" and \"sse-c\".", passed)]
     InvalidEncryptionType { passed: String },
 
-    #[snafu(display(
+    #[error(
         "Invalid encryption header values. Header: {}, source: {}",
         header,
         source
-    ))]
+    )]
     InvalidEncryptionHeader {
         header: &'static str,
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
@@ -159,13 +160,19 @@ pub struct AmazonS3Builder {
     /// Copy if not exists
     copy_if_not_exists: Option<ConfigValue<S3CopyIfNotExists>>,
     /// Put precondition
-    conditional_put: Option<ConfigValue<S3ConditionalPut>>,
+    conditional_put: ConfigValue<S3ConditionalPut>,
     /// Ignore tags
     disable_tagging: ConfigValue<bool>,
     /// Encryption (See [`S3EncryptionConfigKey`])
     encryption_type: Option<ConfigValue<S3EncryptionType>>,
     encryption_kms_key_id: Option<String>,
     encryption_bucket_key_enabled: Option<ConfigValue<bool>>,
+    /// base64-encoded 256-bit customer encryption key for SSE-C.
+    encryption_customer_key_base64: Option<String>,
+    /// When set to true, charge requester for bucket operations
+    request_payer: ConfigValue<bool>,
+    /// The [`HttpConnector`] to use
+    http_connector: Option<Arc<dyn HttpConnector>>,
 }
 
 /// Configuration keys for [`AmazonS3Builder`]
@@ -326,6 +333,13 @@ pub enum AmazonS3ConfigKey {
     /// - `s3_express`
     S3Express,
 
+    /// Enable Support for S3 Requester Pays
+    ///
+    /// Supported keys:
+    /// - `aws_request_payer`
+    /// - `request_payer`
+    RequestPayer,
+
     /// Client options
     Client(ClientConfigKey),
 
@@ -354,6 +368,7 @@ impl AsRef<str> for AmazonS3ConfigKey {
             Self::CopyIfNotExists => "aws_copy_if_not_exists",
             Self::ConditionalPut => "aws_conditional_put",
             Self::DisableTagging => "aws_disable_tagging",
+            Self::RequestPayer => "aws_request_payer",
             Self::Client(opt) => opt.as_ref(),
             Self::Encryption(opt) => opt.as_ref(),
         }
@@ -385,6 +400,7 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_copy_if_not_exists" | "copy_if_not_exists" => Ok(Self::CopyIfNotExists),
             "aws_conditional_put" | "conditional_put" => Ok(Self::ConditionalPut),
             "aws_disable_tagging" | "disable_tagging" => Ok(Self::DisableTagging),
+            "aws_request_payer" | "request_payer" => Ok(Self::RequestPayer),
             // Backwards compatibility
             "aws_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
             "aws_server_side_encryption" => Ok(Self::Encryption(
@@ -394,7 +410,10 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_sse_bucket_key_enabled" => {
                 Ok(Self::Encryption(S3EncryptionConfigKey::BucketKeyEnabled))
             }
-            _ => match s.parse() {
+            "aws_sse_customer_key_base64" => Ok(Self::Encryption(
+                S3EncryptionConfigKey::CustomerEncryptionKey,
+            )),
+            _ => match s.strip_prefix("aws_").unwrap_or(s).parse() {
                 Ok(key) => Ok(Self::Client(key)),
                 Err(_) => Err(Error::UnknownConfigurationKey { key: s.into() }.into()),
             },
@@ -410,7 +429,11 @@ impl AmazonS3Builder {
 
     /// Fill the [`AmazonS3Builder`] with regular AWS environment variables
     ///
-    /// Variables extracted from environment:
+    /// All environment variables starting with `AWS_` will be evaluated. Names must
+    /// match acceptable input to [`AmazonS3ConfigKey::from_str`]. Only upper-case environment
+    /// variables are accepted.
+    ///
+    /// Some examples of variables extracted from environment:
     /// * `AWS_ACCESS_KEY_ID` -> access_key_id
     /// * `AWS_SECRET_ACCESS_KEY` -> secret_access_key
     /// * `AWS_DEFAULT_REGION` -> region
@@ -418,6 +441,7 @@ impl AmazonS3Builder {
     /// * `AWS_SESSION_TOKEN` -> token
     /// * `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` -> <https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html>
     /// * `AWS_ALLOW_HTTP` -> set to "true" to permit HTTP connections without TLS
+    /// * `AWS_REQUEST_PAYER` -> set to "true" to permit operations on requester-pays buckets.
     /// # Example
     /// ```
     /// use object_store::aws::AmazonS3Builder;
@@ -501,7 +525,10 @@ impl AmazonS3Builder {
                 self.copy_if_not_exists = Some(ConfigValue::Deferred(value.into()))
             }
             AmazonS3ConfigKey::ConditionalPut => {
-                self.conditional_put = Some(ConfigValue::Deferred(value.into()))
+                self.conditional_put = ConfigValue::Deferred(value.into())
+            }
+            AmazonS3ConfigKey::RequestPayer => {
+                self.request_payer = ConfigValue::Deferred(value.into())
             }
             AmazonS3ConfigKey::Encryption(key) => match key {
                 S3EncryptionConfigKey::ServerSideEncryption => {
@@ -510,6 +537,9 @@ impl AmazonS3Builder {
                 S3EncryptionConfigKey::KmsKeyId => self.encryption_kms_key_id = Some(value.into()),
                 S3EncryptionConfigKey::BucketKeyEnabled => {
                     self.encryption_bucket_key_enabled = Some(ConfigValue::Deferred(value.into()))
+                }
+                S3EncryptionConfigKey::CustomerEncryptionKey => {
+                    self.encryption_customer_key_base64 = Some(value.into())
                 }
             },
         };
@@ -553,10 +583,9 @@ impl AmazonS3Builder {
             AmazonS3ConfigKey::CopyIfNotExists => {
                 self.copy_if_not_exists.as_ref().map(ToString::to_string)
             }
-            AmazonS3ConfigKey::ConditionalPut => {
-                self.conditional_put.as_ref().map(ToString::to_string)
-            }
+            AmazonS3ConfigKey::ConditionalPut => Some(self.conditional_put.to_string()),
             AmazonS3ConfigKey::DisableTagging => Some(self.disable_tagging.to_string()),
+            AmazonS3ConfigKey::RequestPayer => Some(self.request_payer.to_string()),
             AmazonS3ConfigKey::Encryption(key) => match key {
                 S3EncryptionConfigKey::ServerSideEncryption => {
                     self.encryption_type.as_ref().map(ToString::to_string)
@@ -566,6 +595,9 @@ impl AmazonS3Builder {
                     .encryption_bucket_key_enabled
                     .as_ref()
                     .map(ToString::to_string),
+                S3EncryptionConfigKey::CustomerEncryptionKey => {
+                    self.encryption_customer_key_base64.clone()
+                }
             },
         }
     }
@@ -575,8 +607,15 @@ impl AmazonS3Builder {
     /// This is a separate member function to allow fallible computation to
     /// be deferred until [`Self::build`] which in turn allows deriving [`Clone`]
     fn parse_url(&mut self, url: &str) -> Result<()> {
-        let parsed = Url::parse(url).context(UnableToParseUrlSnafu { url })?;
-        let host = parsed.host_str().context(UrlNotRecognisedSnafu { url })?;
+        let parsed = Url::parse(url).map_err(|source| {
+            let url = url.into();
+            Error::UnableToParseUrl { url, source }
+        })?;
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| Error::UrlNotRecognised { url: url.into() })?;
+
         match parsed.scheme() {
             "s3" | "s3a" => self.bucket_name = Some(host.to_string()),
             "https" => match host.splitn(4, '.').collect_tuple() {
@@ -602,9 +641,12 @@ impl AmazonS3Builder {
                         self.bucket_name = Some(bucket.into());
                     }
                 }
-                _ => return Err(UrlNotRecognisedSnafu { url }.build().into()),
+                _ => return Err(Error::UrlNotRecognised { url: url.into() }.into()),
             },
-            scheme => return Err(UnknownUrlSchemeSnafu { scheme }.build().into()),
+            scheme => {
+                let scheme = scheme.into();
+                return Err(Error::UnknownUrlScheme { scheme }.into());
+            }
         };
         Ok(())
     }
@@ -783,9 +825,10 @@ impl AmazonS3Builder {
         self
     }
 
-    /// Configure how to provide conditional put operations
+    /// Configure how to provide conditional put operations.
+    /// if not set, the default value will be `S3ConditionalPut::ETagMatch`
     pub fn with_conditional_put(mut self, config: S3ConditionalPut) -> Self {
-        self.conditional_put = Some(config.into());
+        self.conditional_put = config.into();
         self
     }
 
@@ -813,6 +856,14 @@ impl AmazonS3Builder {
         self
     }
 
+    /// Use SSE-C for server side encryption.
+    /// Must pass the *base64-encoded* 256-bit customer encryption key.
+    pub fn with_ssec_encryption(mut self, customer_key_base64: impl Into<String>) -> Self {
+        self.encryption_type = Some(ConfigValue::Parsed(S3EncryptionType::SseC));
+        self.encryption_customer_key_base64 = customer_key_base64.into().into();
+        self
+    }
+
     /// Set whether to enable bucket key for server side encryption. This overrides
     /// the bucket default setting for bucket keys.
     ///
@@ -824,6 +875,22 @@ impl AmazonS3Builder {
         self
     }
 
+    /// Set whether to charge requester for bucket operations.
+    ///
+    /// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/RequesterPaysBuckets.html>
+    pub fn with_request_payer(mut self, enabled: bool) -> Self {
+        self.request_payer = ConfigValue::Parsed(enabled);
+        self
+    }
+
+    /// The [`HttpConnector`] to use
+    ///
+    /// On non-WASM32 platforms uses [`reqwest`] by default, on WASM32 platforms must be provided
+    pub fn with_http_connector<C: HttpConnector>(mut self, connector: C) -> Self {
+        self.http_connector = Some(Arc::new(connector));
+        self
+    }
+
     /// Create a [`AmazonS3`] instance from the provided values,
     /// consuming `self`.
     pub fn build(mut self) -> Result<AmazonS3> {
@@ -831,11 +898,12 @@ impl AmazonS3Builder {
             self.parse_url(&url)?;
         }
 
-        let bucket = self.bucket_name.context(MissingBucketNameSnafu)?;
+        let http = http_connector(self.http_connector)?;
+
+        let bucket = self.bucket_name.ok_or(Error::MissingBucketName)?;
         let region = self.region.unwrap_or_else(|| "us-east-1".to_string());
         let checksum = self.checksum_algorithm.map(|x| x.get()).transpose()?;
         let copy_if_not_exists = self.copy_if_not_exists.map(|x| x.get()).transpose()?;
-        let put_precondition = self.conditional_put.map(|x| x.get()).transpose()?;
 
         let credentials = if let Some(credentials) = self.credentials {
             credentials
@@ -867,11 +935,7 @@ impl AmazonS3Builder {
             let endpoint = format!("https://sts.{region}.amazonaws.com");
 
             // Disallow non-HTTPs requests
-            let client = self
-                .client_options
-                .clone()
-                .with_allow_http(false)
-                .client()?;
+            let options = self.client_options.clone().with_allow_http(false);
 
             let token = WebIdentityProvider {
                 token_path,
@@ -882,16 +946,19 @@ impl AmazonS3Builder {
 
             Arc::new(TokenCredentialProvider::new(
                 token,
-                client,
+                http.connect(&options)?,
                 self.retry_config.clone(),
             )) as _
         } else if let Some(uri) = self.container_credentials_relative_uri {
             info!("Using Task credential provider");
+
+            let options = self.client_options.clone().with_allow_http(true);
+
             Arc::new(TaskCredentialProvider {
                 url: format!("http://169.254.170.2{uri}"),
                 retry: self.retry_config.clone(),
                 // The instance metadata endpoint is access over HTTP
-                client: self.client_options.clone().with_allow_http(true).client()?,
+                client: http.connect(&options)?,
                 cache: Default::default(),
             }) as _
         } else {
@@ -906,14 +973,17 @@ impl AmazonS3Builder {
 
             Arc::new(TokenCredentialProvider::new(
                 token,
-                self.client_options.metadata_client()?,
+                http.connect(&self.client_options.metadata_options())?,
                 self.retry_config.clone(),
             )) as _
         };
 
         let (session_provider, zonal_endpoint) = match self.s3_express.get()? {
             true => {
-                let zone = parse_bucket_az(&bucket).context(ZoneSuffixSnafu { bucket: &bucket })?;
+                let zone = parse_bucket_az(&bucket).ok_or_else(|| {
+                    let bucket = bucket.clone();
+                    Error::ZoneSuffix { bucket }
+                })?;
 
                 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-Regions-and-Zones.html
                 let endpoint = format!("https://{bucket}.s3express-{zone}.{region}.amazonaws.com");
@@ -925,7 +995,7 @@ impl AmazonS3Builder {
                             region: region.clone(),
                             credentials: Arc::clone(&credentials),
                         },
-                        self.client_options.client()?,
+                        http.connect(&self.client_options)?,
                         self.retry_config.clone(),
                     )
                     .with_min_ttl(Duration::from_secs(60)), // Credentials only valid for 5 minutes
@@ -940,7 +1010,7 @@ impl AmazonS3Builder {
         let virtual_hosted = self.virtual_hosted_style_request.get()?;
         let bucket_endpoint = match (&self.endpoint, zonal_endpoint, virtual_hosted) {
             (Some(endpoint), _, true) => endpoint.clone(),
-            (Some(endpoint), _, false) => format!("{endpoint}/{bucket}"),
+            (Some(endpoint), _, false) => format!("{}/{}", endpoint.trim_end_matches("/"), bucket),
             (None, Some(endpoint), _) => endpoint,
             (None, None, true) => format!("https://{bucket}.s3.{region}.amazonaws.com"),
             (None, None, false) => format!("https://s3.{region}.amazonaws.com/{bucket}"),
@@ -953,6 +1023,7 @@ impl AmazonS3Builder {
                 self.encryption_bucket_key_enabled
                     .map(|val| val.get())
                     .transpose()?,
+                self.encryption_customer_key_base64,
             )?
         } else {
             S3EncryptionHeaders::default()
@@ -972,11 +1043,13 @@ impl AmazonS3Builder {
             disable_tagging: self.disable_tagging.get()?,
             checksum,
             copy_if_not_exists,
-            conditional_put: put_precondition,
+            conditional_put: self.conditional_put.get()?,
             encryption_headers,
+            request_payer: self.request_payer.get()?,
         };
 
-        let client = Arc::new(S3Client::new(config)?);
+        let http_client = http.connect(&config.client_options)?;
+        let client = Arc::new(S3Client::new(config, http_client));
 
         Ok(AmazonS3 { client })
     }
@@ -994,15 +1067,14 @@ fn parse_bucket_az(bucket: &str) -> Option<&str> {
 /// These options are used to configure server-side encryption for S3 objects.
 /// To configure them, pass them to [`AmazonS3Builder::with_config`].
 ///
-/// Both [SSE-KMS] and [DSSE-KMS] are supported. [SSE-C] is not yet supported.
-///
+/// [SSE-S3]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingServerSideEncryption.html
 /// [SSE-KMS]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html
 /// [DSSE-KMS]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingDSSEncryption.html
 /// [SSE-C]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerSideEncryptionCustomerKeys.html
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum S3EncryptionConfigKey {
-    /// Type of encryption to use. If set, must be one of "AES256", "aws:kms", or "aws:kms:dsse".
+    /// Type of encryption to use. If set, must be one of "AES256" (SSE-S3), "aws:kms" (SSE-KMS), "aws:kms:dsse" (DSSE-KMS) or "sse-c".
     ServerSideEncryption,
     /// The KMS key ID to use for server-side encryption. If set, ServerSideEncryption
     /// must be "aws:kms" or "aws:kms:dsse".
@@ -1010,6 +1082,10 @@ pub enum S3EncryptionConfigKey {
     /// If set to true, will use the bucket's default KMS key for server-side encryption.
     /// If set to false, will disable the use of the bucket's default KMS key for server-side encryption.
     BucketKeyEnabled,
+
+    /// The base64 encoded, 256-bit customer encryption key to use for server-side encryption.
+    /// If set, ServerSideEncryption must be "sse-c".
+    CustomerEncryptionKey,
 }
 
 impl AsRef<str> for S3EncryptionConfigKey {
@@ -1018,6 +1094,7 @@ impl AsRef<str> for S3EncryptionConfigKey {
             Self::ServerSideEncryption => "aws_server_side_encryption",
             Self::KmsKeyId => "aws_sse_kms_key_id",
             Self::BucketKeyEnabled => "aws_sse_bucket_key_enabled",
+            Self::CustomerEncryptionKey => "aws_sse_customer_key_base64",
         }
     }
 }
@@ -1027,6 +1104,7 @@ enum S3EncryptionType {
     S3,
     SseKms,
     DsseKms,
+    SseC,
 }
 
 impl crate::config::Parse for S3EncryptionType {
@@ -1035,6 +1113,7 @@ impl crate::config::Parse for S3EncryptionType {
             "AES256" => Ok(Self::S3),
             "aws:kms" => Ok(Self::SseKms),
             "aws:kms:dsse" => Ok(Self::DsseKms),
+            "sse-c" => Ok(Self::SseC),
             _ => Err(Error::InvalidEncryptionType { passed: s.into() }.into()),
         }
     }
@@ -1046,6 +1125,7 @@ impl From<&S3EncryptionType> for &'static str {
             S3EncryptionType::S3 => "AES256",
             S3EncryptionType::SseKms => "aws:kms",
             S3EncryptionType::DsseKms => "aws:kms:dsse",
+            S3EncryptionType::SseC => "sse-c",
         }
     }
 }
@@ -1062,37 +1142,87 @@ impl std::fmt::Display for S3EncryptionType {
 /// Whether these headers are sent depends on both the kind of encryption set
 /// and the kind of request being made.
 #[derive(Default, Clone, Debug)]
-pub struct S3EncryptionHeaders(HeaderMap);
+pub(super) struct S3EncryptionHeaders(pub HeaderMap);
 
 impl S3EncryptionHeaders {
     fn try_new(
         encryption_type: &S3EncryptionType,
-        key_id: Option<String>,
+        encryption_kms_key_id: Option<String>,
         bucket_key_enabled: Option<bool>,
+        encryption_customer_key_base64: Option<String>,
     ) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        // Note: if we later add support for SSE-C, we should be sure to use
-        // HeaderValue::set_sensitive to prevent the key from being logged.
-        headers.insert(
-            "x-amz-server-side-encryption",
-            HeaderValue::from_static(encryption_type.into()),
-        );
-        if let Some(key_id) = key_id {
-            headers.insert(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                key_id
-                    .try_into()
-                    .map_err(|err| Error::InvalidEncryptionHeader {
-                        header: "kms-key-id",
-                        source: Box::new(err),
-                    })?,
-            );
-        }
-        if let Some(bucket_key_enabled) = bucket_key_enabled {
-            headers.insert(
-                "x-amz-server-side-encryption-bucket-key-enabled",
-                HeaderValue::from_static(if bucket_key_enabled { "true" } else { "false" }),
-            );
+        match encryption_type {
+            S3EncryptionType::S3 | S3EncryptionType::SseKms | S3EncryptionType::DsseKms => {
+                headers.insert(
+                    "x-amz-server-side-encryption",
+                    HeaderValue::from_static(encryption_type.into()),
+                );
+                if let Some(key_id) = encryption_kms_key_id {
+                    headers.insert(
+                        "x-amz-server-side-encryption-aws-kms-key-id",
+                        key_id
+                            .try_into()
+                            .map_err(|err| Error::InvalidEncryptionHeader {
+                                header: "kms-key-id",
+                                source: Box::new(err),
+                            })?,
+                    );
+                }
+                if let Some(bucket_key_enabled) = bucket_key_enabled {
+                    headers.insert(
+                        "x-amz-server-side-encryption-bucket-key-enabled",
+                        HeaderValue::from_static(if bucket_key_enabled { "true" } else { "false" }),
+                    );
+                }
+            }
+            S3EncryptionType::SseC => {
+                headers.insert(
+                    "x-amz-server-side-encryption-customer-algorithm",
+                    HeaderValue::from_static("AES256"),
+                );
+                if let Some(key) = encryption_customer_key_base64 {
+                    let mut header_value: HeaderValue =
+                        key.clone()
+                            .try_into()
+                            .map_err(|err| Error::InvalidEncryptionHeader {
+                                header: "x-amz-server-side-encryption-customer-key",
+                                source: Box::new(err),
+                            })?;
+                    header_value.set_sensitive(true);
+                    headers.insert("x-amz-server-side-encryption-customer-key", header_value);
+
+                    let decoded_key = BASE64_STANDARD.decode(key.as_bytes()).map_err(|err| {
+                        Error::InvalidEncryptionHeader {
+                            header: "x-amz-server-side-encryption-customer-key",
+                            source: Box::new(err),
+                        }
+                    })?;
+                    let mut hasher = Md5::new();
+                    hasher.update(decoded_key);
+                    let md5 = BASE64_STANDARD.encode(hasher.finalize());
+                    let mut md5_header_value: HeaderValue =
+                        md5.try_into()
+                            .map_err(|err| Error::InvalidEncryptionHeader {
+                                header: "x-amz-server-side-encryption-customer-key-MD5",
+                                source: Box::new(err),
+                            })?;
+                    md5_header_value.set_sensitive(true);
+                    headers.insert(
+                        "x-amz-server-side-encryption-customer-key-MD5",
+                        md5_header_value,
+                    );
+                } else {
+                    return Err(Error::InvalidEncryptionHeader {
+                        header: "x-amz-server-side-encryption-customer-key",
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Missing customer key",
+                        )),
+                    }
+                    .into());
+                }
+            }
         }
         Ok(Self(headers))
     }
@@ -1162,7 +1292,11 @@ mod tests {
             .with_config(AmazonS3ConfigKey::UnsignedPayload, "true")
             .with_config("aws_server_side_encryption".parse().unwrap(), "AES256")
             .with_config("aws_sse_kms_key_id".parse().unwrap(), "some_key_id")
-            .with_config("aws_sse_bucket_key_enabled".parse().unwrap(), "true");
+            .with_config("aws_sse_bucket_key_enabled".parse().unwrap(), "true")
+            .with_config(
+                "aws_sse_customer_key_base64".parse().unwrap(),
+                "some_customer_key",
+            );
 
         assert_eq!(
             builder
@@ -1216,6 +1350,12 @@ mod tests {
                 .unwrap(),
             "true"
         );
+        assert_eq!(
+            builder
+                .get_config_value(&"aws_sse_customer_key_base64".parse().unwrap())
+                .unwrap(),
+            "some_customer_key"
+        );
     }
 
     #[test]
@@ -1225,6 +1365,29 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(builder.client.config.region, "us-east-1");
+    }
+
+    #[test]
+    fn s3_test_bucket_endpoint() {
+        let builder = AmazonS3Builder::new()
+            .with_endpoint("http://some.host:1234")
+            .with_bucket_name("foo")
+            .build()
+            .unwrap();
+        assert_eq!(
+            builder.client.config.bucket_endpoint,
+            "http://some.host:1234/foo"
+        );
+
+        let builder = AmazonS3Builder::new()
+            .with_endpoint("http://some.host:1234/")
+            .with_bucket_name("foo")
+            .build()
+            .unwrap();
+        assert_eq!(
+            builder.client.config.bucket_endpoint,
+            "http://some.host:1234/foo"
+        );
     }
 
     #[test]
@@ -1363,6 +1526,19 @@ mod tests {
 
         for (bucket, expected) in cases {
             assert_eq!(parse_bucket_az(bucket), expected)
+        }
+    }
+
+    #[test]
+    fn aws_test_client_opts() {
+        let key = "AWS_PROXY_URL";
+        if let Ok(config_key) = key.to_ascii_lowercase().parse() {
+            assert_eq!(
+                AmazonS3ConfigKey::Client(ClientConfigKey::ProxyUrl),
+                config_key
+            );
+        } else {
+            panic!("{} not propagated as ClientConfigKey", key);
         }
     }
 }

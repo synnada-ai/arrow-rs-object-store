@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client::TokenCredentialProvider;
+use crate::client::{http_connector, HttpConnector, TokenCredentialProvider};
+use crate::config::ConfigValue;
 use crate::gcp::client::{GoogleCloudStorageClient, GoogleCloudStorageConfig};
 use crate::gcp::credential::{
     ApplicationDefaultCredentials, InstanceCredentialProvider, ServiceAccountCredentials,
@@ -27,40 +28,42 @@ use crate::gcp::{
 };
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt, Snafu};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 
 use super::credential::{AuthorizedUserSigningCredentials, InstanceSigningCredentialProvider};
 
-#[derive(Debug, Snafu)]
+const TOKEN_MIN_TTL: Duration = Duration::from_secs(4 * 60);
+
+#[derive(Debug, thiserror::Error)]
 enum Error {
-    #[snafu(display("Missing bucket name"))]
+    #[error("Missing bucket name")]
     MissingBucketName {},
 
-    #[snafu(display("One of service account path or service account key may be provided."))]
+    #[error("One of service account path or service account key may be provided.")]
     ServiceAccountPathAndKeyProvided,
 
-    #[snafu(display("Unable parse source url. Url: {}, Error: {}", url, source))]
+    #[error("Unable parse source url. Url: {}, Error: {}", url, source)]
     UnableToParseUrl {
         source: url::ParseError,
         url: String,
     },
 
-    #[snafu(display(
+    #[error(
         "Unknown url scheme cannot be parsed into storage location: {}",
         scheme
-    ))]
+    )]
     UnknownUrlScheme { scheme: String },
 
-    #[snafu(display("URL did not match any known pattern for scheme: {}", url))]
+    #[error("URL did not match any known pattern for scheme: {}", url)]
     UrlNotRecognised { url: String },
 
-    #[snafu(display("Configuration key: '{}' is not known.", key))]
+    #[error("Configuration key: '{}' is not known.", key)]
     UnknownConfigurationKey { key: String },
 
-    #[snafu(display("GCP credential error: {}", source))]
+    #[error("GCP credential error: {}", source)]
     Credential { source: credential::Error },
 }
 
@@ -107,8 +110,12 @@ pub struct GoogleCloudStorageBuilder {
     client_options: ClientOptions,
     /// Credentials
     credentials: Option<GcpCredentialProvider>,
+    /// Skip signing requests
+    skip_signature: ConfigValue<bool>,
     /// Credentials for sign url
     signing_credentials: Option<GcpSigningCredentialProvider>,
+    /// The [`HttpConnector`] to use
+    http_connector: Option<Arc<dyn HttpConnector>>,
 }
 
 /// Configuration keys for [`GoogleCloudStorageBuilder`]
@@ -157,6 +164,9 @@ pub enum GoogleConfigKey {
     /// See [`GoogleCloudStorageBuilder::with_application_credentials`].
     ApplicationCredentials,
 
+    /// Skip signing request
+    SkipSignature,
+
     /// Client options
     Client(ClientConfigKey),
 }
@@ -168,6 +178,7 @@ impl AsRef<str> for GoogleConfigKey {
             Self::ServiceAccountKey => "google_service_account_key",
             Self::Bucket => "google_bucket",
             Self::ApplicationCredentials => "google_application_credentials",
+            Self::SkipSignature => "google_skip_signature",
             Self::Client(key) => key.as_ref(),
         }
     }
@@ -185,7 +196,8 @@ impl FromStr for GoogleConfigKey {
             "google_service_account_key" | "service_account_key" => Ok(Self::ServiceAccountKey),
             "google_bucket" | "google_bucket_name" | "bucket" | "bucket_name" => Ok(Self::Bucket),
             "google_application_credentials" => Ok(Self::ApplicationCredentials),
-            _ => match s.parse() {
+            "google_skip_signature" | "skip_signature" => Ok(Self::SkipSignature),
+            _ => match s.strip_prefix("google_").unwrap_or(s).parse() {
                 Ok(key) => Ok(Self::Client(key)),
                 Err(_) => Err(Error::UnknownConfigurationKey { key: s.into() }.into()),
             },
@@ -204,7 +216,9 @@ impl Default for GoogleCloudStorageBuilder {
             client_options: ClientOptions::new().with_allow_http(true),
             url: None,
             credentials: None,
+            skip_signature: Default::default(),
             signing_credentials: None,
+            http_connector: None,
         }
     }
 }
@@ -283,6 +297,7 @@ impl GoogleCloudStorageBuilder {
             GoogleConfigKey::ApplicationCredentials => {
                 self.application_credentials_path = Some(value.into())
             }
+            GoogleConfigKey::SkipSignature => self.skip_signature.parse(value),
             GoogleConfigKey::Client(key) => {
                 self.client_options = self.client_options.with_config(key, value)
             }
@@ -307,6 +322,7 @@ impl GoogleCloudStorageBuilder {
             GoogleConfigKey::ServiceAccountKey => self.service_account_key.clone(),
             GoogleConfigKey::Bucket => self.bucket_name.clone(),
             GoogleConfigKey::ApplicationCredentials => self.application_credentials_path.clone(),
+            GoogleConfigKey::SkipSignature => Some(self.skip_signature.to_string()),
             GoogleConfigKey::Client(key) => self.client_options.get_config_value(key),
         }
     }
@@ -316,12 +332,21 @@ impl GoogleCloudStorageBuilder {
     /// This is a separate member function to allow fallible computation to
     /// be deferred until [`Self::build`] which in turn allows deriving [`Clone`]
     fn parse_url(&mut self, url: &str) -> Result<()> {
-        let parsed = Url::parse(url).context(UnableToParseUrlSnafu { url })?;
-        let host = parsed.host_str().context(UrlNotRecognisedSnafu { url })?;
+        let parsed = Url::parse(url).map_err(|source| Error::UnableToParseUrl {
+            source,
+            url: url.to_string(),
+        })?;
+
+        let host = parsed.host_str().ok_or_else(|| Error::UrlNotRecognised {
+            url: url.to_string(),
+        })?;
 
         match parsed.scheme() {
             "gs" => self.bucket_name = Some(host.to_string()),
-            scheme => return Err(UnknownUrlSchemeSnafu { scheme }.build().into()),
+            scheme => {
+                let scheme = scheme.to_string();
+                return Err(Error::UnknownUrlScheme { scheme }.into());
+            }
         }
         Ok(())
     }
@@ -375,6 +400,14 @@ impl GoogleCloudStorageBuilder {
         self
     }
 
+    /// If enabled, [`GoogleCloudStorage`] will not fetch credentials and will not sign requests.
+    ///
+    /// This can be useful when interacting with public GCS buckets that deny authorized requests.
+    pub fn with_skip_signature(mut self, skip_signature: bool) -> Self {
+        self.skip_signature = skip_signature.into();
+        self
+    }
+
     /// Set the credential provider overriding any other options
     pub fn with_credentials(mut self, credentials: GcpCredentialProvider) -> Self {
         self.credentials = Some(credentials);
@@ -413,6 +446,14 @@ impl GoogleCloudStorageBuilder {
         self
     }
 
+    /// The [`HttpConnector`] to use
+    ///
+    /// On non-WASM32 platforms uses [`reqwest`] by default, on WASM32 platforms must be provided
+    pub fn with_http_connector<C: HttpConnector>(mut self, connector: C) -> Self {
+        self.http_connector = Some(Arc::new(connector));
+        self
+    }
+
     /// Configure a connection to Google Cloud Storage, returning a
     /// new [`GoogleCloudStorage`] and consuming `self`
     pub fn build(mut self) -> Result<GoogleCloudStorage> {
@@ -422,15 +463,19 @@ impl GoogleCloudStorageBuilder {
 
         let bucket_name = self.bucket_name.ok_or(Error::MissingBucketName {})?;
 
+        let http = http_connector(self.http_connector)?;
+
         // First try to initialize from the service account information.
         let service_account_credentials =
             match (self.service_account_path, self.service_account_key) {
-                (Some(path), None) => {
-                    Some(ServiceAccountCredentials::from_file(path).context(CredentialSnafu)?)
-                }
-                (None, Some(key)) => {
-                    Some(ServiceAccountCredentials::from_key(&key).context(CredentialSnafu)?)
-                }
+                (Some(path), None) => Some(
+                    ServiceAccountCredentials::from_file(path)
+                        .map_err(|source| Error::Credential { source })?,
+                ),
+                (None, Some(key)) => Some(
+                    ServiceAccountCredentials::from_key(&key)
+                        .map_err(|source| Error::Credential { source })?,
+                ),
                 (None, None) => None,
                 (Some(_), Some(_)) => return Err(Error::ServiceAccountPathAndKeyProvided.into()),
             };
@@ -458,32 +503,36 @@ impl GoogleCloudStorageBuilder {
         } else if let Some(credentials) = service_account_credentials.clone() {
             Arc::new(TokenCredentialProvider::new(
                 credentials.token_provider()?,
-                self.client_options.client()?,
+                http.connect(&self.client_options)?,
                 self.retry_config.clone(),
             )) as _
         } else if let Some(credentials) = application_default_credentials.clone() {
             match credentials {
-                ApplicationDefaultCredentials::AuthorizedUser(token) => {
-                    Arc::new(TokenCredentialProvider::new(
+                ApplicationDefaultCredentials::AuthorizedUser(token) => Arc::new(
+                    TokenCredentialProvider::new(
                         token,
-                        self.client_options.client()?,
+                        http.connect(&self.client_options)?,
                         self.retry_config.clone(),
-                    )) as _
-                }
+                    )
+                    .with_min_ttl(TOKEN_MIN_TTL),
+                ) as _,
                 ApplicationDefaultCredentials::ServiceAccount(token) => {
                     Arc::new(TokenCredentialProvider::new(
                         token.token_provider()?,
-                        self.client_options.client()?,
+                        http.connect(&self.client_options)?,
                         self.retry_config.clone(),
                     )) as _
                 }
             }
         } else {
-            Arc::new(TokenCredentialProvider::new(
-                InstanceCredentialProvider::default(),
-                self.client_options.metadata_client()?,
-                self.retry_config.clone(),
-            )) as _
+            Arc::new(
+                TokenCredentialProvider::new(
+                    InstanceCredentialProvider::default(),
+                    http.connect(&self.client_options.metadata_options())?,
+                    self.retry_config.clone(),
+                )
+                .with_min_ttl(TOKEN_MIN_TTL),
+            ) as _
         };
 
         let signing_credentials = if let Some(signing_credentials) = self.signing_credentials {
@@ -500,7 +549,7 @@ impl GoogleCloudStorageBuilder {
                 ApplicationDefaultCredentials::AuthorizedUser(token) => {
                     Arc::new(TokenCredentialProvider::new(
                         AuthorizedUserSigningCredentials::from(token)?,
-                        self.client_options.client()?,
+                        http.connect(&self.client_options)?,
                         self.retry_config.clone(),
                     )) as _
                 }
@@ -511,22 +560,24 @@ impl GoogleCloudStorageBuilder {
         } else {
             Arc::new(TokenCredentialProvider::new(
                 InstanceSigningCredentialProvider::default(),
-                self.client_options.metadata_client()?,
+                http.connect(&self.client_options.metadata_options())?,
                 self.retry_config.clone(),
             )) as _
         };
 
-        let config = GoogleCloudStorageConfig::new(
-            gcs_base_url,
+        let config = GoogleCloudStorageConfig {
+            base_url: gcs_base_url,
             credentials,
             signing_credentials,
             bucket_name,
-            self.retry_config,
-            self.client_options,
-        );
+            retry_config: self.retry_config,
+            client_options: self.client_options,
+            skip_signature: self.skip_signature.get()?,
+        };
 
+        let http_client = http.connect(&config.client_options)?;
         Ok(GoogleCloudStorage {
-            client: Arc::new(GoogleCloudStorageClient::new(config)?),
+            client: Arc::new(GoogleCloudStorageClient::new(config, http_client)?),
         })
     }
 }
@@ -670,5 +721,18 @@ mod tests {
             builder.get_config_value(&GoogleConfigKey::Bucket).unwrap(),
             google_bucket_name
         );
+    }
+
+    #[test]
+    fn gcp_test_client_opts() {
+        let key = "GOOGLE_PROXY_URL";
+        if let Ok(config_key) = key.to_ascii_lowercase().parse() {
+            assert_eq!(
+                GoogleConfigKey::Client(ClientConfigKey::ProxyUrl),
+                config_key
+            );
+        } else {
+            panic!("{} not propagated as ClientConfigKey", key);
+        }
     }
 }

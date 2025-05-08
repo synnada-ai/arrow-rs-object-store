@@ -48,7 +48,7 @@ use crate::{
 use async_trait::async_trait;
 use client::GoogleCloudStorageClient;
 use futures::stream::BoxStream;
-use hyper::Method;
+use http::Method;
 use url::Url;
 
 use crate::client::get::GetClientExt;
@@ -72,7 +72,7 @@ pub type GcpSigningCredentialProvider =
     Arc<dyn CredentialProvider<Credential = GcpSigningCredential>>;
 
 /// Interface for [Google Cloud Storage](https://cloud.google.com/storage/).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GoogleCloudStorage {
     client: Arc<GoogleCloudStorageClient>,
 }
@@ -183,7 +183,7 @@ impl ObjectStore for GoogleCloudStorage {
         self.client.delete_request(location).await
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.client.list(prefix)
     }
 
@@ -191,7 +191,7 @@ impl ObjectStore for GoogleCloudStorage {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, Result<ObjectMeta>> {
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         self.client.list_with_offset(prefix, offset)
     }
 
@@ -297,6 +297,8 @@ mod test {
             // https://github.com/fsouza/fake-gcs-server/issues/852
             stream_get(&integration).await;
             multipart(&integration, &integration).await;
+            multipart_race_condition(&integration, true).await;
+            multipart_out_of_order(&integration).await;
             // Fake GCS server doesn't currently honor preconditions
             get_opts(&integration).await;
             put_opts(&integration, true).await;
@@ -412,7 +414,7 @@ mod test {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("Client error with status 404 Not Found"),
+            err.contains("Server returned non-2xx status code: 404 Not Found"),
             "{}",
             err
         )

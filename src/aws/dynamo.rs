@@ -23,7 +23,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use reqwest::{Response, StatusCode};
+use http::{Method, StatusCode};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -31,8 +31,8 @@ use crate::aws::client::S3Client;
 use crate::aws::credential::CredentialExt;
 use crate::aws::{AwsAuthorizer, AwsCredential};
 use crate::client::get::GetClientExt;
-use crate::client::retry::Error as RetryError;
 use crate::client::retry::RetryExt;
+use crate::client::retry::{RequestError, RetryError};
 use crate::path::Path;
 use crate::{Error, GetOptions, Result};
 
@@ -317,20 +317,20 @@ impl DynamoCommit {
         cred: Option<&AwsCredential>,
         target: &str,
         req: R,
-    ) -> Result<Response, RetryError> {
+    ) -> Result<HttpResponse, RetryError> {
         let region = &s3.config.region;
         let authorizer = cred.map(|x| AwsAuthorizer::new(x, "dynamodb", region));
 
         let builder = match &s3.config.endpoint {
-            Some(e) => s3.client.post(e),
+            Some(e) => s3.client.request(Method::POST, e),
             None => {
                 let url = format!("https://dynamodb.{region}.amazonaws.com");
-                s3.client.post(url)
+                s3.client.request(Method::POST, url)
             }
         };
 
+        // TODO: Timeout
         builder
-            .timeout(Duration::from_millis(self.timeout))
             .json(&req)
             .header("X-Amz-Target", target)
             .with_aws_sigv4(authorizer, None)
@@ -383,8 +383,8 @@ async fn check_precondition(client: &S3Client, path: &Path, etag: Option<&str>) 
 
 /// Parses the error response if any
 fn parse_error_response(e: &RetryError) -> Option<ErrorResponse<'_>> {
-    match e {
-        RetryError::Client {
+    match e.inner() {
+        RequestError::Status {
             status: StatusCode::BAD_REQUEST,
             body: Some(b),
         } => serde_json::from_str(b).ok(),
@@ -471,7 +471,7 @@ enum ReturnValues {
 /// This provides cheap, ordered serialization of maps
 struct Map<'a, K, V>(&'a [(K, V)]);
 
-impl<'a, K: Serialize, V: Serialize> Serialize for Map<'a, K, V> {
+impl<K: Serialize, V: Serialize> Serialize for Map<'_, K, V> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -508,16 +508,17 @@ impl<'a> From<&'a str> for AttributeValue<'a> {
 mod number {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&v.to_string())
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
         let v: &str = Deserialize::deserialize(d)?;
         v.parse().map_err(serde::de::Error::custom)
     }
 }
 
+use crate::client::HttpResponse;
 /// Re-export integration_test to be called by s3_test
 #[cfg(test)]
 pub(crate) use tests::integration_test;
@@ -527,8 +528,8 @@ mod tests {
     use super::*;
     use crate::aws::AmazonS3;
     use crate::ObjectStore;
-    use rand::distributions::Alphanumeric;
-    use rand::{thread_rng, Rng};
+    use rand::distr::Alphanumeric;
+    use rand::{rng, Rng};
 
     #[test]
     fn test_attribute_serde() {
@@ -541,7 +542,7 @@ mod tests {
     /// An integration test for DynamoDB
     ///
     /// This is a function called by s3_test to avoid test concurrency issues
-    pub async fn integration_test(integration: &AmazonS3, d: &DynamoCommit) {
+    pub(crate) async fn integration_test(integration: &AmazonS3, d: &DynamoCommit) {
         let client = integration.client.as_ref();
 
         let src = Path::from("dynamo_path_src");
@@ -571,7 +572,7 @@ mod tests {
             _ => panic!("Should conflict"),
         }
 
-        let rng = thread_rng();
+        let rng = rng();
         let etag = String::from_utf8(rng.sample_iter(Alphanumeric).take(32).collect()).unwrap();
         let t = Some(etag.as_str());
 

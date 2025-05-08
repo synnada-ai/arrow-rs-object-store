@@ -17,16 +17,15 @@
 
 use crate::azure::client::{AzureClient, AzureConfig};
 use crate::azure::credential::{
-    AzureAccessKey, AzureCliCredential, ClientSecretOAuthProvider, ImdsManagedIdentityProvider,
-    WorkloadIdentityOAuthProvider,
+    AzureAccessKey, AzureCliCredential, ClientSecretOAuthProvider, FabricTokenOAuthProvider,
+    ImdsManagedIdentityProvider, WorkloadIdentityOAuthProvider,
 };
 use crate::azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzure, STORE};
-use crate::client::TokenCredentialProvider;
+use crate::client::{http_connector, HttpConnector, TokenCredentialProvider};
 use crate::config::ConfigValue;
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt, Snafu};
 use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
@@ -45,49 +44,48 @@ const EMULATOR_ACCOUNT_KEY: &str =
 const MSI_ENDPOINT_ENV_KEY: &str = "IDENTITY_ENDPOINT";
 
 /// A specialized `Error` for Azure builder-related errors
-#[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
 enum Error {
-    #[snafu(display("Unable parse source url. Url: {}, Error: {}", url, source))]
+    #[error("Unable parse source url. Url: {}, Error: {}", url, source)]
     UnableToParseUrl {
         source: url::ParseError,
         url: String,
     },
 
-    #[snafu(display(
+    #[error(
         "Unable parse emulator url {}={}, Error: {}",
         env_name,
         env_value,
         source
-    ))]
+    )]
     UnableToParseEmulatorUrl {
         env_name: String,
         env_value: String,
         source: url::ParseError,
     },
 
-    #[snafu(display("Account must be specified"))]
+    #[error("Account must be specified")]
     MissingAccount {},
 
-    #[snafu(display("Container name must be specified"))]
+    #[error("Container name must be specified")]
     MissingContainerName {},
 
-    #[snafu(display(
+    #[error(
         "Unknown url scheme cannot be parsed into storage location: {}",
         scheme
-    ))]
+    )]
     UnknownUrlScheme { scheme: String },
 
-    #[snafu(display("URL did not match any known pattern for scheme: {}", url))]
+    #[error("URL did not match any known pattern for scheme: {}", url)]
     UrlNotRecognised { url: String },
 
-    #[snafu(display("Failed parsing an SAS key"))]
+    #[error("Failed parsing an SAS key")]
     DecodeSasKey { source: std::str::Utf8Error },
 
-    #[snafu(display("Missing component in SAS query pair"))]
+    #[error("Missing component in SAS query pair")]
     MissingSasComponent {},
 
-    #[snafu(display("Configuration key: '{}' is not known.", key))]
+    #[error("Configuration key: '{}' is not known.", key)]
     UnknownConfigurationKey { key: String },
 }
 
@@ -172,6 +170,16 @@ pub struct MicrosoftAzureBuilder {
     use_fabric_endpoint: ConfigValue<bool>,
     /// When set to true, skips tagging objects
     disable_tagging: ConfigValue<bool>,
+    /// Fabric token service url
+    fabric_token_service_url: Option<String>,
+    /// Fabric workload host
+    fabric_workload_host: Option<String>,
+    /// Fabric session token
+    fabric_session_token: Option<String>,
+    /// Fabric cluster identifier
+    fabric_cluster_identifier: Option<String>,
+    /// The [`HttpConnector`] to use
+    http_connector: Option<Arc<dyn HttpConnector>>,
 }
 
 /// Configuration keys for [`MicrosoftAzureBuilder`]
@@ -232,6 +240,14 @@ pub enum AzureConfigKey {
     /// - `tenant_id`
     /// - `authority_id`
     AuthorityId,
+
+    /// Authority host used in oauth flows
+    ///
+    /// Supported keys:
+    /// - `azure_storage_authority_host`
+    /// - `azure_authority_host`
+    /// - `authority_host`
+    AuthorityHost,
 
     /// Shared access signature.
     ///
@@ -336,6 +352,34 @@ pub enum AzureConfigKey {
     /// - `disable_tagging`
     DisableTagging,
 
+    /// Fabric token service url
+    ///
+    /// Supported keys:
+    /// - `azure_fabric_token_service_url`
+    /// - `fabric_token_service_url`
+    FabricTokenServiceUrl,
+
+    /// Fabric workload host
+    ///
+    /// Supported keys:
+    /// - `azure_fabric_workload_host`
+    /// - `fabric_workload_host`
+    FabricWorkloadHost,
+
+    /// Fabric session token
+    ///
+    /// Supported keys:
+    /// - `azure_fabric_session_token`
+    /// - `fabric_session_token`
+    FabricSessionToken,
+
+    /// Fabric cluster identifier
+    ///
+    /// Supported keys:
+    /// - `azure_fabric_cluster_identifier`
+    /// - `fabric_cluster_identifier`
+    FabricClusterIdentifier,
+
     /// Client options
     Client(ClientConfigKey),
 }
@@ -348,6 +392,7 @@ impl AsRef<str> for AzureConfigKey {
             Self::ClientId => "azure_storage_client_id",
             Self::ClientSecret => "azure_storage_client_secret",
             Self::AuthorityId => "azure_storage_tenant_id",
+            Self::AuthorityHost => "azure_storage_authority_host",
             Self::SasKey => "azure_storage_sas_key",
             Self::Token => "azure_storage_token",
             Self::UseEmulator => "azure_storage_use_emulator",
@@ -361,6 +406,10 @@ impl AsRef<str> for AzureConfigKey {
             Self::SkipSignature => "azure_skip_signature",
             Self::ContainerName => "azure_container_name",
             Self::DisableTagging => "azure_disable_tagging",
+            Self::FabricTokenServiceUrl => "azure_fabric_token_service_url",
+            Self::FabricWorkloadHost => "azure_fabric_workload_host",
+            Self::FabricSessionToken => "azure_fabric_session_token",
+            Self::FabricClusterIdentifier => "azure_fabric_cluster_identifier",
             Self::Client(key) => key.as_ref(),
         }
     }
@@ -388,6 +437,9 @@ impl FromStr for AzureConfigKey {
             | "azure_authority_id"
             | "tenant_id"
             | "authority_id" => Ok(Self::AuthorityId),
+            "azure_storage_authority_host" | "azure_authority_host" | "authority_host" => {
+                Ok(Self::AuthorityHost)
+            }
             "azure_storage_sas_key" | "azure_storage_sas_token" | "sas_key" | "sas_token" => {
                 Ok(Self::SasKey)
             }
@@ -406,9 +458,17 @@ impl FromStr for AzureConfigKey {
             "azure_skip_signature" | "skip_signature" => Ok(Self::SkipSignature),
             "azure_container_name" | "container_name" => Ok(Self::ContainerName),
             "azure_disable_tagging" | "disable_tagging" => Ok(Self::DisableTagging),
+            "azure_fabric_token_service_url" | "fabric_token_service_url" => {
+                Ok(Self::FabricTokenServiceUrl)
+            }
+            "azure_fabric_workload_host" | "fabric_workload_host" => Ok(Self::FabricWorkloadHost),
+            "azure_fabric_session_token" | "fabric_session_token" => Ok(Self::FabricSessionToken),
+            "azure_fabric_cluster_identifier" | "fabric_cluster_identifier" => {
+                Ok(Self::FabricClusterIdentifier)
+            }
             // Backwards compatibility
             "azure_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
-            _ => match s.parse() {
+            _ => match s.strip_prefix("azure_").unwrap_or(s).parse() {
                 Ok(key) => Ok(Self::Client(key)),
                 Err(_) => Err(Error::UnknownConfigurationKey { key: s.into() }.into()),
             },
@@ -509,6 +569,7 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::ClientId => self.client_id = Some(value.into()),
             AzureConfigKey::ClientSecret => self.client_secret = Some(value.into()),
             AzureConfigKey::AuthorityId => self.tenant_id = Some(value.into()),
+            AzureConfigKey::AuthorityHost => self.authority_host = Some(value.into()),
             AzureConfigKey::SasKey => self.sas_key = Some(value.into()),
             AzureConfigKey::Token => self.bearer_token = Some(value.into()),
             AzureConfigKey::MsiEndpoint => self.msi_endpoint = Some(value.into()),
@@ -525,6 +586,14 @@ impl MicrosoftAzureBuilder {
             }
             AzureConfigKey::ContainerName => self.container_name = Some(value.into()),
             AzureConfigKey::DisableTagging => self.disable_tagging.parse(value),
+            AzureConfigKey::FabricTokenServiceUrl => {
+                self.fabric_token_service_url = Some(value.into())
+            }
+            AzureConfigKey::FabricWorkloadHost => self.fabric_workload_host = Some(value.into()),
+            AzureConfigKey::FabricSessionToken => self.fabric_session_token = Some(value.into()),
+            AzureConfigKey::FabricClusterIdentifier => {
+                self.fabric_cluster_identifier = Some(value.into())
+            }
         };
         self
     }
@@ -547,6 +616,7 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::ClientId => self.client_id.clone(),
             AzureConfigKey::ClientSecret => self.client_secret.clone(),
             AzureConfigKey::AuthorityId => self.tenant_id.clone(),
+            AzureConfigKey::AuthorityHost => self.authority_host.clone(),
             AzureConfigKey::SasKey => self.sas_key.clone(),
             AzureConfigKey::Token => self.bearer_token.clone(),
             AzureConfigKey::UseEmulator => Some(self.use_emulator.to_string()),
@@ -561,6 +631,10 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::Client(key) => self.client_options.get_config_value(key),
             AzureConfigKey::ContainerName => self.container_name.clone(),
             AzureConfigKey::DisableTagging => Some(self.disable_tagging.to_string()),
+            AzureConfigKey::FabricTokenServiceUrl => self.fabric_token_service_url.clone(),
+            AzureConfigKey::FabricWorkloadHost => self.fabric_workload_host.clone(),
+            AzureConfigKey::FabricSessionToken => self.fabric_session_token.clone(),
+            AzureConfigKey::FabricClusterIdentifier => self.fabric_cluster_identifier.clone(),
         }
     }
 
@@ -569,11 +643,17 @@ impl MicrosoftAzureBuilder {
     /// This is a separate member function to allow fallible computation to
     /// be deferred until [`Self::build`] which in turn allows deriving [`Clone`]
     fn parse_url(&mut self, url: &str) -> Result<()> {
-        let parsed = Url::parse(url).context(UnableToParseUrlSnafu { url })?;
-        let host = parsed.host_str().context(UrlNotRecognisedSnafu { url })?;
+        let parsed = Url::parse(url).map_err(|source| {
+            let url = url.into();
+            Error::UnableToParseUrl { url, source }
+        })?;
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| Error::UrlNotRecognised { url: url.into() })?;
 
         let validate = |s: &str| match s.contains('.') {
-            true => Err(UrlNotRecognisedSnafu { url }.build()),
+            true => Err(Error::UrlNotRecognised { url: url.into() }),
             false => Ok(s.to_string()),
         };
 
@@ -592,7 +672,7 @@ impl MicrosoftAzureBuilder {
                     self.account_name = Some(validate(a)?);
                     self.use_fabric_endpoint = true.into();
                 } else {
-                    return Err(UrlNotRecognisedSnafu { url }.build().into());
+                    return Err(Error::UrlNotRecognised { url: url.into() }.into());
                 }
             }
             "https" => match host.split_once('.') {
@@ -616,9 +696,12 @@ impl MicrosoftAzureBuilder {
                     }
                     self.use_fabric_endpoint = true.into();
                 }
-                _ => return Err(UrlNotRecognisedSnafu { url }.build().into()),
+                _ => return Err(Error::UrlNotRecognised { url: url.into() }.into()),
             },
-            scheme => return Err(UnknownUrlSchemeSnafu { scheme }.build().into()),
+            scheme => {
+                let scheme = scheme.into();
+                return Err(Error::UnknownUrlScheme { scheme }.into());
+            }
         }
         Ok(())
     }
@@ -806,6 +889,14 @@ impl MicrosoftAzureBuilder {
         self
     }
 
+    /// The [`HttpConnector`] to use
+    ///
+    /// On non-WASM32 platforms uses [`reqwest`] by default, on WASM32 platforms must be provided
+    pub fn with_http_connector<C: HttpConnector>(mut self, connector: C) -> Self {
+        self.http_connector = Some(Arc::new(connector));
+        self
+    }
+
     /// Configure a connection to container with given name on Microsoft Azure Blob store.
     pub fn build(mut self) -> Result<MicrosoftAzure> {
         if let Some(url) = self.url.take() {
@@ -817,6 +908,8 @@ impl MicrosoftAzureBuilder {
         let static_creds = |credential: AzureCredential| -> AzureCredentialProvider {
             Arc::new(StaticCredentialProvider::new(credential))
         };
+
+        let http = http_connector(self.http_connector)?;
 
         let (is_emulator, storage_url, auth, account) = if self.use_emulator.get()? {
             let account_name = self
@@ -851,11 +944,37 @@ impl MicrosoftAzureBuilder {
                 },
             };
 
-            let url =
-                Url::parse(&account_url).context(UnableToParseUrlSnafu { url: account_url })?;
+            let url = Url::parse(&account_url).map_err(|source| {
+                let url = account_url.clone();
+                Error::UnableToParseUrl { url, source }
+            })?;
 
             let credential = if let Some(credential) = self.credentials {
                 credential
+            } else if let (
+                Some(fabric_token_service_url),
+                Some(fabric_workload_host),
+                Some(fabric_session_token),
+                Some(fabric_cluster_identifier),
+            ) = (
+                &self.fabric_token_service_url,
+                &self.fabric_workload_host,
+                &self.fabric_session_token,
+                &self.fabric_cluster_identifier,
+            ) {
+                // This case should precede the bearer token case because it is more specific and will utilize the bearer token.
+                let fabric_credential = FabricTokenOAuthProvider::new(
+                    fabric_token_service_url,
+                    fabric_workload_host,
+                    fabric_session_token,
+                    fabric_cluster_identifier,
+                    self.bearer_token.clone(),
+                );
+                Arc::new(TokenCredentialProvider::new(
+                    fabric_credential,
+                    http.connect(&self.client_options)?,
+                    self.retry_config.clone(),
+                )) as _
             } else if let Some(bearer_token) = self.bearer_token {
                 static_creds(AzureCredential::BearerToken(bearer_token))
             } else if let Some(access_key) = self.access_key {
@@ -872,7 +991,7 @@ impl MicrosoftAzureBuilder {
                 );
                 Arc::new(TokenCredentialProvider::new(
                     client_credential,
-                    self.client_options.client()?,
+                    http.connect(&self.client_options)?,
                     self.retry_config.clone(),
                 )) as _
             } else if let (Some(client_id), Some(client_secret), Some(tenant_id)) =
@@ -886,7 +1005,7 @@ impl MicrosoftAzureBuilder {
                 );
                 Arc::new(TokenCredentialProvider::new(
                     client_credential,
-                    self.client_options.client()?,
+                    http.connect(&self.client_options)?,
                     self.retry_config.clone(),
                 )) as _
             } else if let Some(query_pairs) = self.sas_query_pairs {
@@ -904,7 +1023,7 @@ impl MicrosoftAzureBuilder {
                 );
                 Arc::new(TokenCredentialProvider::new(
                     msi_credential,
-                    self.client_options.metadata_client()?,
+                    http.connect(&self.client_options.metadata_options())?,
                     self.retry_config.clone(),
                 )) as _
             };
@@ -923,7 +1042,8 @@ impl MicrosoftAzureBuilder {
             credentials: auth,
         };
 
-        let client = Arc::new(AzureClient::new(config)?);
+        let http_client = http.connect(&config.client_options)?;
+        let client = Arc::new(AzureClient::new(config, http_client));
 
         Ok(MicrosoftAzure { client })
     }
@@ -933,10 +1053,13 @@ impl MicrosoftAzureBuilder {
 /// if present, otherwise falls back to default_url
 fn url_from_env(env_name: &str, default_url: &str) -> Result<Url> {
     let url = match std::env::var(env_name) {
-        Ok(env_value) => Url::parse(&env_value).context(UnableToParseEmulatorUrlSnafu {
-            env_name,
-            env_value,
-        })?,
+        Ok(env_value) => {
+            Url::parse(&env_value).map_err(|source| Error::UnableToParseEmulatorUrl {
+                env_name: env_name.into(),
+                env_value,
+                source,
+            })?
+        }
         Err(_) => Url::parse(default_url).expect("Failed to parse default URL"),
     };
     Ok(url)
@@ -945,7 +1068,7 @@ fn url_from_env(env_name: &str, default_url: &str) -> Result<Url> {
 fn split_sas(sas: &str) -> Result<Vec<(String, String)>, Error> {
     let sas = percent_decode_str(sas)
         .decode_utf8()
-        .context(DecodeSasKeySnafu {})?;
+        .map_err(|source| Error::DecodeSasKey { source })?;
     let kv_str_pairs = sas
         .trim_start_matches('?')
         .split('&')
@@ -1102,5 +1225,18 @@ mod tests {
         ];
         let pairs = split_sas(raw_sas).unwrap();
         assert_eq!(expected, pairs);
+    }
+
+    #[test]
+    fn azure_test_client_opts() {
+        let key = "AZURE_PROXY_URL";
+        if let Ok(config_key) = key.to_ascii_lowercase().parse() {
+            assert_eq!(
+                AzureConfigKey::Client(ClientConfigKey::ProxyUrl),
+                config_key
+            );
+        } else {
+            panic!("{} not propagated as ClientConfigKey", key);
+        }
     }
 }

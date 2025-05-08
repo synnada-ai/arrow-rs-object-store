@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use rand::prelude::*;
+use rand::{prelude::*, rng};
 use std::time::Duration;
 
-/// Exponential backoff with jitter
+/// Exponential backoff with decorrelated jitter algorithm
+///
+/// The first backoff will always be `init_backoff`.
+///
+/// Subsequent backoffs will pick a random value between `init_backoff` and
+/// `base * previous` where `previous` is the duration of the previous backoff
 ///
 /// See <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>
 #[allow(missing_copy_implementations)]
@@ -28,7 +33,7 @@ pub struct BackoffConfig {
     pub init_backoff: Duration,
     /// The maximum backoff duration
     pub max_backoff: Duration,
-    /// The base of the exponential to use
+    /// The multiplier to use for the next backoff duration
     pub base: f64,
 }
 
@@ -46,7 +51,7 @@ impl Default for BackoffConfig {
 ///
 /// Consecutive calls to [`Backoff::next`] will return the next backoff interval
 ///
-pub struct Backoff {
+pub(crate) struct Backoff {
     init_backoff: f64,
     next_backoff_secs: f64,
     max_backoff_secs: f64,
@@ -67,14 +72,14 @@ impl std::fmt::Debug for Backoff {
 
 impl Backoff {
     /// Create a new [`Backoff`] from the provided [`BackoffConfig`]
-    pub fn new(config: &BackoffConfig) -> Self {
+    pub(crate) fn new(config: &BackoffConfig) -> Self {
         Self::new_with_rng(config, None)
     }
 
     /// Creates a new `Backoff` with the optional `rng`
     ///
-    /// Used [`rand::thread_rng()`] if no rng provided
-    pub fn new_with_rng(
+    /// Used [`rand::rng()`] if no rng provided
+    pub(crate) fn new_with_rng(
         config: &BackoffConfig,
         rng: Option<Box<dyn RngCore + Sync + Send>>,
     ) -> Self {
@@ -89,12 +94,12 @@ impl Backoff {
     }
 
     /// Returns the next backoff duration to wait for
-    pub fn next(&mut self) -> Duration {
+    pub(crate) fn next(&mut self) -> Duration {
         let range = self.init_backoff..(self.next_backoff_secs * self.base);
 
         let rand_backoff = match self.rng.as_mut() {
-            Some(rng) => rng.gen_range(range),
-            None => thread_rng().gen_range(range),
+            Some(rng) => rng.random_range(range),
+            None => rng().random_range(range),
         };
 
         let next_backoff = self.max_backoff_secs.min(rand_backoff);

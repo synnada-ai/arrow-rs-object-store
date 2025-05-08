@@ -17,41 +17,57 @@
 
 //! Generic utilities reqwest based ObjectStore implementations
 
-pub mod backoff;
+pub(crate) mod backoff;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod dns;
+
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
-pub mod mock_server;
+pub(crate) mod mock_server;
 
-pub mod retry;
-
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-pub mod pagination;
-
-pub mod get;
+pub(crate) mod retry;
 
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-pub mod list;
+pub(crate) mod pagination;
+
+pub(crate) mod get;
 
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-pub mod token;
+pub(crate) mod list;
 
-pub mod header;
+#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+pub(crate) mod token;
+
+pub(crate) mod header;
 
 #[cfg(any(feature = "aws", feature = "gcp"))]
-pub mod s3;
+pub(crate) mod s3;
+
+mod body;
+pub use body::{HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody};
+
+pub(crate) mod builder;
+
+mod connection;
+pub(crate) use connection::http_connector;
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi")))]
+pub use connection::ReqwestConnector;
+pub use connection::{HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpService};
 
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-pub mod parts;
+pub(crate) mod parts;
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Client, ClientBuilder, NoProxy, Proxy, RequestBuilder};
-use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
+use reqwest::{NoProxy, Proxy};
 
 use crate::config::{fmt_duration, ConfigValue};
 use crate::path::Path;
@@ -94,6 +110,8 @@ pub enum ClientConfigKey {
     Http2KeepAliveTimeout,
     /// Enable HTTP2 keep alive pings for idle connections
     Http2KeepAliveWhileIdle,
+    /// Sets the maximum frame size to use for HTTP2.
+    Http2MaxFrameSize,
     /// Only use http2 connections
     Http2Only,
     /// The pool max idle timeout
@@ -108,6 +126,10 @@ pub enum ClientConfigKey {
     ProxyCaCertificate,
     /// List of hosts that bypass proxy
     ProxyExcludes,
+    /// Randomize order addresses that the DNS resolution yields.
+    ///
+    /// This will spread the connections accross more servers.
+    RandomizeAddresses,
     /// Request timeout
     ///
     /// The timeout is applied from when the request starts connecting until the
@@ -129,11 +151,13 @@ impl AsRef<str> for ClientConfigKey {
             Self::Http2KeepAliveInterval => "http2_keep_alive_interval",
             Self::Http2KeepAliveTimeout => "http2_keep_alive_timeout",
             Self::Http2KeepAliveWhileIdle => "http2_keep_alive_while_idle",
+            Self::Http2MaxFrameSize => "http2_max_frame_size",
             Self::PoolIdleTimeout => "pool_idle_timeout",
             Self::PoolMaxIdlePerHost => "pool_max_idle_per_host",
             Self::ProxyUrl => "proxy_url",
             Self::ProxyCaCertificate => "proxy_ca_certificate",
             Self::ProxyExcludes => "proxy_excludes",
+            Self::RandomizeAddresses => "randomize_addresses",
             Self::Timeout => "timeout",
             Self::UserAgent => "user_agent",
         }
@@ -154,9 +178,13 @@ impl FromStr for ClientConfigKey {
             "http2_keep_alive_interval" => Ok(Self::Http2KeepAliveInterval),
             "http2_keep_alive_timeout" => Ok(Self::Http2KeepAliveTimeout),
             "http2_keep_alive_while_idle" => Ok(Self::Http2KeepAliveWhileIdle),
+            "http2_max_frame_size" => Ok(Self::Http2MaxFrameSize),
             "pool_idle_timeout" => Ok(Self::PoolIdleTimeout),
             "pool_max_idle_per_host" => Ok(Self::PoolMaxIdlePerHost),
             "proxy_url" => Ok(Self::ProxyUrl),
+            "proxy_ca_certificate" => Ok(Self::ProxyCaCertificate),
+            "proxy_excludes" => Ok(Self::ProxyExcludes),
+            "randomize_addresses" => Ok(Self::RandomizeAddresses),
             "timeout" => Ok(Self::Timeout),
             "user_agent" => Ok(Self::UserAgent),
             _ => Err(super::Error::UnknownConfigurationKey {
@@ -167,10 +195,63 @@ impl FromStr for ClientConfigKey {
     }
 }
 
+/// Represents a CA certificate provided by the user.
+///
+/// This is used to configure the client to trust a specific certificate. See
+/// [Self::from_pem] for an example
+#[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
+pub struct Certificate(reqwest::tls::Certificate);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Certificate {
+    /// Create a `Certificate` from a PEM encoded certificate.
+    ///
+    /// # Example from a PEM file
+    ///
+    /// ```no_run
+    /// # use object_store::Certificate;
+    /// # use std::fs::File;
+    /// # use std::io::Read;
+    /// let mut buf = Vec::new();
+    /// File::open("my_cert.pem").unwrap()
+    ///   .read_to_end(&mut buf).unwrap();
+    /// let cert = Certificate::from_pem(&buf).unwrap();
+    ///
+    /// ```
+    pub fn from_pem(pem: &[u8]) -> Result<Self> {
+        Ok(Self(
+            reqwest::tls::Certificate::from_pem(pem).map_err(map_client_error)?,
+        ))
+    }
+
+    /// Create a collection of `Certificate` from a PEM encoded certificate
+    /// bundle.
+    ///
+    /// Files that contain such collections have extensions such as `.crt`,
+    /// `.cer` and `.pem` files.
+    pub fn from_pem_bundle(pem_bundle: &[u8]) -> Result<Vec<Self>> {
+        Ok(reqwest::tls::Certificate::from_pem_bundle(pem_bundle)
+            .map_err(map_client_error)?
+            .into_iter()
+            .map(Self)
+            .collect())
+    }
+
+    /// Create a `Certificate` from a binary DER encoded certificate.
+    pub fn from_der(der: &[u8]) -> Result<Self> {
+        Ok(Self(
+            reqwest::tls::Certificate::from_der(der).map_err(map_client_error)?,
+        ))
+    }
+}
+
 /// HTTP client configuration for remote object stores
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     user_agent: Option<ConfigValue<HeaderValue>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    root_certificates: Vec<Certificate>,
     content_type_map: HashMap<String, String>,
     default_content_type: Option<String>,
     default_headers: Option<HeaderMap>,
@@ -186,8 +267,10 @@ pub struct ClientOptions {
     http2_keep_alive_interval: Option<ConfigValue<Duration>>,
     http2_keep_alive_timeout: Option<ConfigValue<Duration>>,
     http2_keep_alive_while_idle: ConfigValue<bool>,
+    http2_max_frame_size: Option<ConfigValue<u32>>,
     http1_only: ConfigValue<bool>,
     http2_only: ConfigValue<bool>,
+    randomize_addresses: ConfigValue<bool>,
 }
 
 impl Default for ClientOptions {
@@ -201,6 +284,8 @@ impl Default for ClientOptions {
         // we opt for a slightly higher default timeout of 30 seconds
         Self {
             user_agent: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            root_certificates: Default::default(),
             content_type_map: Default::default(),
             default_content_type: None,
             default_headers: None,
@@ -216,11 +301,13 @@ impl Default for ClientOptions {
             http2_keep_alive_interval: None,
             http2_keep_alive_timeout: None,
             http2_keep_alive_while_idle: Default::default(),
+            http2_max_frame_size: None,
             // HTTP2 is known to be significantly slower than HTTP1, so we default
             // to HTTP1 for now.
             // https://github.com/apache/arrow-rs/issues/5194
             http1_only: true.into(),
             http2_only: Default::default(),
+            randomize_addresses: true.into(),
         }
     }
 }
@@ -251,6 +338,9 @@ impl ClientOptions {
             ClientConfigKey::Http2KeepAliveWhileIdle => {
                 self.http2_keep_alive_while_idle.parse(value)
             }
+            ClientConfigKey::Http2MaxFrameSize => {
+                self.http2_max_frame_size = Some(ConfigValue::Deferred(value.into()))
+            }
             ClientConfigKey::PoolIdleTimeout => {
                 self.pool_idle_timeout = Some(ConfigValue::Deferred(value.into()))
             }
@@ -260,6 +350,9 @@ impl ClientOptions {
             ClientConfigKey::ProxyUrl => self.proxy_url = Some(value.into()),
             ClientConfigKey::ProxyCaCertificate => self.proxy_ca_certificate = Some(value.into()),
             ClientConfigKey::ProxyExcludes => self.proxy_excludes = Some(value.into()),
+            ClientConfigKey::RandomizeAddresses => {
+                self.randomize_addresses.parse(value);
+            }
             ClientConfigKey::Timeout => self.timeout = Some(ConfigValue::Deferred(value.into())),
             ClientConfigKey::UserAgent => {
                 self.user_agent = Some(ConfigValue::Deferred(value.into()))
@@ -285,6 +378,9 @@ impl ClientOptions {
             ClientConfigKey::Http2KeepAliveWhileIdle => {
                 Some(self.http2_keep_alive_while_idle.to_string())
             }
+            ClientConfigKey::Http2MaxFrameSize => {
+                self.http2_max_frame_size.as_ref().map(|v| v.to_string())
+            }
             ClientConfigKey::Http2Only => Some(self.http2_only.to_string()),
             ClientConfigKey::PoolIdleTimeout => self.pool_idle_timeout.as_ref().map(fmt_duration),
             ClientConfigKey::PoolMaxIdlePerHost => {
@@ -293,6 +389,7 @@ impl ClientOptions {
             ClientConfigKey::ProxyUrl => self.proxy_url.clone(),
             ClientConfigKey::ProxyCaCertificate => self.proxy_ca_certificate.clone(),
             ClientConfigKey::ProxyExcludes => self.proxy_excludes.clone(),
+            ClientConfigKey::RandomizeAddresses => Some(self.randomize_addresses.to_string()),
             ClientConfigKey::Timeout => self.timeout.as_ref().map(fmt_duration),
             ClientConfigKey::UserAgent => self
                 .user_agent
@@ -307,6 +404,16 @@ impl ClientOptions {
     /// Default is based on the version of this crate
     pub fn with_user_agent(mut self, agent: HeaderValue) -> Self {
         self.user_agent = Some(agent.into());
+        self
+    }
+
+    /// Add a custom root certificate.
+    ///
+    /// This can be used to connect to a server that has a self-signed
+    /// certificate for example.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_root_certificate(mut self, certificate: Certificate) -> Self {
+        self.root_certificates.push(certificate);
         self
     }
 
@@ -427,7 +534,7 @@ impl ClientOptions {
     ///
     /// See [`Self::with_connect_timeout`]
     pub fn with_connect_timeout_disabled(mut self) -> Self {
-        self.timeout = None;
+        self.connect_timeout = None;
         self
     }
 
@@ -479,6 +586,14 @@ impl ClientOptions {
         self
     }
 
+    /// Sets the maximum frame size to use for HTTP2.
+    ///
+    /// Default is currently 16,384 but may change internally to optimize for common uses.
+    pub fn with_http2_max_frame_size(mut self, sz: u32) -> Self {
+        self.http2_max_frame_size = Some(ConfigValue::Parsed(sz));
+        self
+    }
+
     /// Get the mime type for the file in `path` to be uploaded
     ///
     /// Gets the file extension from `path`, and returns the
@@ -497,21 +612,21 @@ impl ClientOptions {
         }
     }
 
-    /// Create a [`Client`] with overrides optimised for metadata endpoint access
+    /// Returns a copy of this [`ClientOptions`] with overrides necessary for metadata endpoint access
     ///
     /// In particular:
     /// * Allows HTTP as metadata endpoints do not use TLS
     /// * Configures a low connection timeout to provide quick feedback if not present
     #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-    pub(crate) fn metadata_client(&self) -> Result<Client> {
+    pub(crate) fn metadata_options(&self) -> Self {
         self.clone()
             .with_allow_http(true)
             .with_connect_timeout(Duration::from_secs(1))
-            .client()
     }
 
-    pub(crate) fn client(&self) -> Result<Client> {
-        let mut builder = ClientBuilder::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn client(&self) -> Result<reqwest::Client> {
+        let mut builder = reqwest::ClientBuilder::new();
 
         match &self.user_agent {
             Some(user_agent) => builder = builder.user_agent(user_agent.get()?),
@@ -539,6 +654,10 @@ impl ClientOptions {
             }
 
             builder = builder.proxy(proxy);
+        }
+
+        for certificate in &self.root_certificates {
+            builder = builder.add_root_certificate(certificate.0.clone());
         }
 
         if let Some(timeout) = &self.timeout {
@@ -569,6 +688,10 @@ impl ClientOptions {
             builder = builder.http2_keep_alive_while_idle(true)
         }
 
+        if let Some(sz) = &self.http2_max_frame_size {
+            builder = builder.http2_max_frame_size(Some(sz.get()?))
+        }
+
         if self.http1_only.get()? {
             builder = builder.http1_only()
         }
@@ -581,41 +704,80 @@ impl ClientOptions {
             builder = builder.danger_accept_invalid_certs(true)
         }
 
+        // Explicitly disable compression, since it may be automatically enabled
+        // when certain reqwest features are enabled. Compression interferes
+        // with the `Content-Length` header, which is used to determine the
+        // size of objects.
+        builder = builder.no_gzip().no_brotli().no_zstd().no_deflate();
+
+        if self.randomize_addresses.get()? {
+            builder = builder.dns_resolver(Arc::new(dns::ShuffleResolver));
+        }
+
         builder
             .https_only(!self.allow_http.get()?)
             .build()
             .map_err(map_client_error)
     }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn client(&self) -> Result<reqwest::Client> {
+        let mut builder = reqwest::ClientBuilder::new();
+
+        match &self.user_agent {
+            Some(user_agent) => builder = builder.user_agent(user_agent.get()?),
+            None => builder = builder.user_agent(DEFAULT_USER_AGENT),
+        }
+
+        if let Some(headers) = &self.default_headers {
+            builder = builder.default_headers(headers.clone())
+        }
+
+        builder.build().map_err(map_client_error)
+    }
 }
 
-pub trait GetOptionsExt {
+pub(crate) trait GetOptionsExt {
     fn with_get_options(self, options: GetOptions) -> Self;
 }
 
-impl GetOptionsExt for RequestBuilder {
+impl GetOptionsExt for HttpRequestBuilder {
     fn with_get_options(mut self, options: GetOptions) -> Self {
         use hyper::header::*;
 
-        if let Some(range) = options.range {
+        let GetOptions {
+            if_match,
+            if_none_match,
+            if_modified_since,
+            if_unmodified_since,
+            range,
+            version: _,
+            head: _,
+            extensions,
+        } = options;
+
+        if let Some(range) = range {
             self = self.header(RANGE, range.to_string());
         }
 
-        if let Some(tag) = options.if_match {
+        if let Some(tag) = if_match {
             self = self.header(IF_MATCH, tag);
         }
 
-        if let Some(tag) = options.if_none_match {
+        if let Some(tag) = if_none_match {
             self = self.header(IF_NONE_MATCH, tag);
         }
 
         const DATE_FORMAT: &str = "%a, %d %b %Y %H:%M:%S GMT";
-        if let Some(date) = options.if_unmodified_since {
+        if let Some(date) = if_unmodified_since {
             self = self.header(IF_UNMODIFIED_SINCE, date.format(DATE_FORMAT).to_string());
         }
 
-        if let Some(date) = options.if_modified_since {
+        if let Some(date) = if_modified_since {
             self = self.header(IF_MODIFIED_SINCE, date.format(DATE_FORMAT).to_string());
         }
+
+        self = self.extensions(extensions);
 
         self
     }
@@ -664,17 +826,17 @@ mod cloud {
     use crate::client::token::{TemporaryToken, TokenCache};
     use crate::RetryConfig;
 
-    /// A [`CredentialProvider`] that uses [`Client`] to fetch temporary tokens
+    /// A [`CredentialProvider`] that uses [`HttpClient`] to fetch temporary tokens
     #[derive(Debug)]
-    pub struct TokenCredentialProvider<T: TokenProvider> {
+    pub(crate) struct TokenCredentialProvider<T: TokenProvider> {
         inner: T,
-        client: Client,
+        client: HttpClient,
         retry: RetryConfig,
         cache: TokenCache<Arc<T::Credential>>,
     }
 
     impl<T: TokenProvider> TokenCredentialProvider<T> {
-        pub fn new(inner: T, client: Client, retry: RetryConfig) -> Self {
+        pub(crate) fn new(inner: T, client: HttpClient, retry: RetryConfig) -> Self {
             Self {
                 inner,
                 client,
@@ -684,8 +846,8 @@ mod cloud {
         }
 
         /// Override the minimum remaining TTL for a cached token to be used
-        #[cfg(feature = "aws")]
-        pub fn with_min_ttl(mut self, min_ttl: Duration) -> Self {
+        #[cfg(any(feature = "aws", feature = "gcp"))]
+        pub(crate) fn with_min_ttl(mut self, min_ttl: Duration) -> Self {
             self.cache = self.cache.with_min_ttl(min_ttl);
             self
         }
@@ -703,19 +865,20 @@ mod cloud {
     }
 
     #[async_trait]
-    pub trait TokenProvider: std::fmt::Debug + Send + Sync {
+    pub(crate) trait TokenProvider: std::fmt::Debug + Send + Sync {
         type Credential: std::fmt::Debug + Send + Sync;
 
         async fn fetch_token(
             &self,
-            client: &Client,
+            client: &HttpClient,
             retry: &RetryConfig,
         ) -> Result<TemporaryToken<Arc<Self::Credential>>>;
     }
 }
 
+use crate::client::builder::HttpRequestBuilder;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-pub use cloud::*;
+pub(crate) use cloud::*;
 
 #[cfg(test)]
 mod tests {
@@ -733,6 +896,7 @@ mod tests {
         let http2_keep_alive_interval = "90 seconds".to_string();
         let http2_keep_alive_timeout = "91 seconds".to_string();
         let http2_keep_alive_while_idle = "92 seconds".to_string();
+        let http2_max_frame_size = "1337".to_string();
         let pool_idle_timeout = "93 seconds".to_string();
         let pool_max_idle_per_host = "94".to_string();
         let proxy_url = "https://fake_proxy_url".to_string();
@@ -758,6 +922,7 @@ mod tests {
                 "http2_keep_alive_while_idle",
                 http2_keep_alive_while_idle.clone(),
             ),
+            ("http2_max_frame_size", http2_max_frame_size.clone()),
             ("pool_idle_timeout", pool_idle_timeout.clone()),
             ("pool_max_idle_per_host", pool_max_idle_per_host.clone()),
             ("proxy_url", proxy_url.clone()),
@@ -824,6 +989,12 @@ mod tests {
                 .get_config_value(&ClientConfigKey::Http2KeepAliveWhileIdle)
                 .unwrap(),
             http2_keep_alive_while_idle
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&ClientConfigKey::Http2MaxFrameSize)
+                .unwrap(),
+            http2_max_frame_size
         );
 
         assert_eq!(

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
@@ -23,7 +24,8 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    unreachable_pub
 )]
 
 //! # object_store
@@ -65,10 +67,13 @@
 //! By default, this crate provides the following implementations:
 //!
 //! * Memory: [`InMemory`](memory::InMemory)
-//! * Local filesystem: [`LocalFileSystem`](local::LocalFileSystem)
 //!
 //! Feature flags are used to enable support for other implementations:
 //!
+#![cfg_attr(
+    feature = "fs",
+    doc = "* Local filesystem: [`LocalFileSystem`](local::LocalFileSystem)"
+)]
 #![cfg_attr(
     feature = "gcp",
     doc = "* [`gcp`]: [Google Cloud Storage](https://cloud.google.com/storage/) support. See [`GoogleCloudStorageBuilder`](gcp::GoogleCloudStorageBuilder)"
@@ -230,7 +235,7 @@
 //!
 //! // Buffer the entire object in memory
 //! let object: Bytes = result.bytes().await.unwrap();
-//! assert_eq!(object.len(), meta.size);
+//! assert_eq!(object.len() as u64, meta.size);
 //!
 //! // Alternatively stream the bytes from object storage
 //! let stream = object_store.get(&path).await.unwrap().into_stream();
@@ -493,12 +498,6 @@
 //! [`webpki-roots`]: https://crates.io/crates/webpki-roots
 //!
 
-#[cfg(all(
-    target_arch = "wasm32",
-    any(feature = "gcp", feature = "aws", feature = "azure", feature = "http")
-))]
-compile_error!("Features 'gcp', 'aws', 'azure', 'http' are not supported on wasm.");
-
 #[cfg(feature = "aws")]
 pub mod aws;
 #[cfg(feature = "azure")]
@@ -512,7 +511,7 @@ pub mod gcp;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod limit;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 pub mod local;
 pub mod memory;
 pub mod path;
@@ -522,13 +521,16 @@ pub mod signer;
 pub mod throttle;
 
 #[cfg(feature = "cloud")]
-mod client;
+pub mod client;
 
 #[cfg(feature = "cloud")]
 pub use client::{
     backoff::BackoffConfig, retry::RetryConfig, ClientConfigKey, ClientOptions, CredentialProvider,
     StaticCredentialProvider,
 };
+
+#[cfg(all(feature = "cloud", not(target_arch = "wasm32")))]
+pub use client::Certificate;
 
 #[cfg(feature = "cloud")]
 mod config;
@@ -556,15 +558,14 @@ pub use upload::*;
 pub use util::{coalesce_ranges, collect_bytes, GetRange, OBJECT_STORE_COALESCE_DEFAULT};
 
 use crate::path::Path;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 use crate::util::maybe_spawn_blocking;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{stream::BoxStream, StreamExt, TryStreamExt};
-use snafu::Snafu;
 use std::fmt::{Debug, Formatter};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
@@ -627,7 +628,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// in the given byte range.
     ///
     /// See [`GetRange::Bounded`] for more details on how `range` gets interpreted
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
         let options = GetOptions {
             range: Some(range.into()),
             ..Default::default()
@@ -637,7 +638,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
 
     /// Return the bytes that are stored at the specified location
     /// in the given byte ranges
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         coalesce_ranges(
             ranges,
             |range| self.get_range(location, range),
@@ -715,11 +716,11 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
 
     /// List all the objects with the given prefix.
     ///
-    /// Prefixes are evaluated on a path segment basis, i.e. `foo/bar/` is a prefix of `foo/bar/x` but not of
+    /// Prefixes are evaluated on a path segment basis, i.e. `foo/bar` is a prefix of `foo/bar/x` but not of
     /// `foo/bar_baz/x`. List is recursive, i.e. `foo/bar/more/x` will be included.
     ///
     /// Note: the order of returned [`ObjectMeta`] is not guaranteed
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>>;
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>>;
 
     /// List all the objects with the given prefix and a location greater than `offset`
     ///
@@ -731,7 +732,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, Result<ObjectMeta>> {
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         let offset = offset.clone();
         self.list(prefix)
             .try_filter(move |f| futures::future::ready(f.location > offset))
@@ -742,7 +743,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// delimiter. Returns common prefixes (directories) in addition to object
     /// metadata.
     ///
-    /// Prefixes are evaluated on a path segment basis, i.e. `foo/bar/` is a prefix of `foo/bar/x` but not of
+    /// Prefixes are evaluated on a path segment basis, i.e. `foo/bar` is a prefix of `foo/bar/x` but not of
     /// `foo/bar_baz/x`. List is not recursive, i.e. `foo/bar/more/x` will not be included.
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult>;
 
@@ -817,14 +818,14 @@ macro_rules! as_ref_impl {
                 self.as_ref().get_opts(location, options).await
             }
 
-            async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+            async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
                 self.as_ref().get_range(location, range).await
             }
 
             async fn get_ranges(
                 &self,
                 location: &Path,
-                ranges: &[Range<usize>],
+                ranges: &[Range<u64>],
             ) -> Result<Vec<Bytes>> {
                 self.as_ref().get_ranges(location, ranges).await
             }
@@ -844,7 +845,7 @@ macro_rules! as_ref_impl {
                 self.as_ref().delete_stream(locations)
             }
 
-            fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
                 self.as_ref().list(prefix)
             }
 
@@ -852,7 +853,7 @@ macro_rules! as_ref_impl {
                 &self,
                 prefix: Option<&Path>,
                 offset: &Path,
-            ) -> BoxStream<'_, Result<ObjectMeta>> {
+            ) -> BoxStream<'static, Result<ObjectMeta>> {
                 self.as_ref().list_with_offset(prefix, offset)
             }
 
@@ -900,8 +901,10 @@ pub struct ObjectMeta {
     pub location: Path,
     /// The last modified time
     pub last_modified: DateTime<Utc>,
-    /// The size in bytes of the object
-    pub size: usize,
+    /// The size in bytes of the object.
+    ///
+    /// Note this is not `usize` as `object_store` supports 32-bit architectures such as WASM
+    pub size: u64,
     /// The unique identifier for the object
     ///
     /// <https://datatracker.ietf.org/doc/html/rfc9110#name-etag>
@@ -911,7 +914,7 @@ pub struct ObjectMeta {
 }
 
 /// Options for a get request, such as range
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GetOptions {
     /// Request will succeed if the `ObjectMeta::e_tag` matches
     /// otherwise returning [`Error::Precondition`]
@@ -962,13 +965,18 @@ pub struct GetOptions {
     ///
     /// <https://datatracker.ietf.org/doc/html/rfc9110#name-head>
     pub head: bool,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to pass context-specific information (like tracing spans) via trait methods.
+    ///
+    /// These extensions are ignored entirely by backends offered through this crate.
+    pub extensions: ::http::Extensions,
 }
 
 impl GetOptions {
     /// Returns an error if the modification conditions on this request are not satisfied
     ///
     /// <https://datatracker.ietf.org/doc/html/rfc7232#section-6>
-    fn check_preconditions(&self, meta: &ObjectMeta) -> Result<()> {
+    pub fn check_preconditions(&self, meta: &ObjectMeta) -> Result<()> {
         // The use of the invalid etag "*" means no ETag is equivalent to never matching
         let etag = meta.e_tag.as_deref().unwrap_or("*");
         let last_modified = meta.last_modified;
@@ -1016,7 +1024,9 @@ pub struct GetResult {
     /// The [`ObjectMeta`] for this object
     pub meta: ObjectMeta,
     /// The range of bytes returned by this request
-    pub range: Range<usize>,
+    ///
+    /// Note this is not `usize` as `object_store` supports 32-bit architectures such as WASM
+    pub range: Range<u64>,
     /// Additional object attributes
     pub attributes: Attributes,
 }
@@ -1027,6 +1037,7 @@ pub struct GetResult {
 /// be able to optimise the case of a file already present on local disk
 pub enum GetResultPayload {
     /// The file, path
+    #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
     File(std::fs::File, std::path::PathBuf),
     /// An opaque stream of bytes
     Stream(BoxStream<'static, Result<Bytes>>),
@@ -1035,6 +1046,7 @@ pub enum GetResultPayload {
 impl Debug for GetResultPayload {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
             Self::File(_, _) => write!(f, "GetResultPayload(File)"),
             Self::Stream(_) => write!(f, "GetResultPayload(Stream)"),
         }
@@ -1046,7 +1058,7 @@ impl GetResult {
     pub async fn bytes(self) -> Result<Bytes> {
         let len = self.range.end - self.range.start;
         match self.payload {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
             GetResultPayload::File(mut file, path) => {
                 maybe_spawn_blocking(move || {
                     file.seek(SeekFrom::Start(self.range.start as _))
@@ -1055,7 +1067,11 @@ impl GetResult {
                             path: path.clone(),
                         })?;
 
-                    let mut buffer = Vec::with_capacity(len);
+                    let mut buffer = if let Ok(len) = len.try_into() {
+                        Vec::with_capacity(len)
+                    } else {
+                        Vec::new()
+                    };
                     file.take(len as _)
                         .read_to_end(&mut buffer)
                         .map_err(|source| local::Error::UnableToReadBytes { source, path })?;
@@ -1065,8 +1081,6 @@ impl GetResult {
                 .await
             }
             GetResultPayload::Stream(s) => collect_bytes(s, Some(len)).await,
-            #[cfg(target_arch = "wasm32")]
-            _ => unimplemented!("File IO not implemented on wasm32."),
         }
     }
 
@@ -1086,14 +1100,12 @@ impl GetResult {
     /// no additional complexity or overheads
     pub fn into_stream(self) -> BoxStream<'static, Result<Bytes>> {
         match self.payload {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
             GetResultPayload::File(file, path) => {
                 const CHUNK_SIZE: usize = 8 * 1024;
                 local::chunked_stream(file, path, self.range, CHUNK_SIZE)
             }
             GetResultPayload::Stream(s) => s,
-            #[cfg(target_arch = "wasm32")]
-            _ => unimplemented!("File IO not implemented on wasm32."),
         }
     }
 }
@@ -1136,7 +1148,7 @@ impl From<PutResult> for UpdateVersion {
 }
 
 /// Options for a put request
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PutOptions {
     /// Configure the [`PutMode`] for this operation
     pub mode: PutMode,
@@ -1148,9 +1160,36 @@ pub struct PutOptions {
     ///
     /// Implementations that don't support an attribute should return an error
     pub attributes: Attributes,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to pass context-specific information (like tracing spans) via trait methods.
+    ///
+    /// These extensions are ignored entirely by backends offered through this crate.
+    ///
+    /// They are also eclused from [`PartialEq`] and [`Eq`].
+    pub extensions: ::http::Extensions,
     /// Copy file and append from it
     pub copy_and_append: bool,
 }
+
+impl PartialEq<Self> for PutOptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            mode,
+            tags,
+            attributes,
+            extensions: _,
+        } = self;
+        let Self {
+            mode: other_mode,
+            tags: other_tags,
+            attributes: other_attributes,
+            extensions: _,
+        } = other;
+        (mode == other_mode) && (tags == other_tags) && (attributes == other_attributes)
+    }
+}
+
+impl Eq for PutOptions {}
 
 impl From<PutMode> for PutOptions {
     fn from(mode: PutMode) -> Self {
@@ -1180,7 +1219,7 @@ impl From<Attributes> for PutOptions {
 }
 
 /// Options for [`ObjectStore::put_multipart_opts`]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PutMultipartOpts {
     /// Provide a [`TagSet`] for this object
     ///
@@ -1190,9 +1229,34 @@ pub struct PutMultipartOpts {
     ///
     /// Implementations that don't support an attribute should return an error
     pub attributes: Attributes,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to pass context-specific information (like tracing spans) via trait methods.
+    ///
+    /// These extensions are ignored entirely by backends offered through this crate.
+    ///
+    /// They are also eclused from [`PartialEq`] and [`Eq`].
+    pub extensions: ::http::Extensions,
     /// Copy file and append from it
     pub copy_and_append: bool,
 }
+
+impl PartialEq<Self> for PutMultipartOpts {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            tags,
+            attributes,
+            extensions: _,
+        } = self;
+        let Self {
+            tags: other_tags,
+            attributes: other_attributes,
+            extensions: _,
+        } = other;
+        (tags == other_tags) && (attributes == other_attributes)
+    }
+}
+
+impl Eq for PutMultipartOpts {}
 
 impl From<TagSet> for PutMultipartOpts {
     fn from(tags: TagSet) -> Self {
@@ -1227,79 +1291,116 @@ pub struct PutResult {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A specialized `Error` for object store-related errors
-#[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    #[snafu(display("Generic {} error: {}", store, source))]
+    /// A fallback error type when no variant matches
+    #[error("Generic {} error: {}", store, source)]
     Generic {
+        /// The store this error originated from
         store: &'static str,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display("Object at location {} not found: {}", path, source))]
+    /// Error when the object is not found at given location
+    #[error("Object at location {} not found: {}", path, source)]
     NotFound {
+        /// The path to file
         path: String,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(
-        display("Encountered object with invalid path: {}", source),
-        context(false)
-    )]
-    InvalidPath { source: path::Error },
+    /// Error for invalid path
+    #[error("Encountered object with invalid path: {}", source)]
+    InvalidPath {
+        /// The wrapped error
+        #[from]
+        source: path::Error,
+    },
 
-    #[snafu(display("Error joining spawned task: {}", source), context(false))]
-    JoinError { source: tokio::task::JoinError },
+    /// Error when `tokio::spawn` failed
+    #[error("Error joining spawned task: {}", source)]
+    JoinError {
+        /// The wrapped error
+        #[from]
+        source: tokio::task::JoinError,
+    },
 
-    #[snafu(display("Operation not supported: {}", source))]
+    /// Error when the attempted operation is not supported
+    #[error("Operation not supported: {}", source)]
     NotSupported {
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display("Object at location {} already exists: {}", path, source))]
+    /// Error when the object already exists
+    #[error("Object at location {} already exists: {}", path, source)]
     AlreadyExists {
+        /// The path to the
         path: String,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display("Request precondition failure for path {}: {}", path, source))]
+    /// Error when the required conditions failed for the operation
+    #[error("Request precondition failure for path {}: {}", path, source)]
     Precondition {
+        /// The path to the file
         path: String,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display("Object at location {} not modified: {}", path, source))]
+    /// Error when the object at the location isn't modified
+    #[error("Object at location {} not modified: {}", path, source)]
     NotModified {
+        /// The path to the file
         path: String,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display("Operation not yet implemented."))]
+    /// Error when an operation is not implemented
+    #[error("Operation not yet implemented.")]
     NotImplemented,
 
-    #[snafu(display(
+    /// Error when the used credentials don't have enough permission
+    /// to perform the requested operation
+    #[error(
         "The operation lacked the necessary privileges to complete for path {}: {}",
         path,
         source
-    ))]
+    )]
     PermissionDenied {
+        /// The path to the file
         path: String,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display(
+    /// Error when the used credentials lack valid authentication
+    #[error(
         "The operation lacked valid authentication credentials for path {}: {}",
         path,
         source
-    ))]
+    )]
     Unauthenticated {
+        /// The path to the file
         path: String,
+        /// The wrapped error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[snafu(display("Configuration key: '{}' is not valid for store '{}'.", key, store))]
-    UnknownConfigurationKey { store: &'static str, key: String },
+    /// Error when a configuration key is invalid for the store used
+    #[error("Configuration key: '{}' is not valid for store '{}'.", key, store)]
+    UnknownConfigurationKey {
+        /// The object store used
+        store: &'static str,
+        /// The configuration key used
+        key: String,
+    },
 }
 
 impl From<Error> for std::io::Error {
@@ -1339,7 +1440,7 @@ mod tests {
     }
 
     #[cfg(any(feature = "azure", feature = "aws"))]
-    pub async fn signing<T>(integration: &T)
+    pub(crate) async fn signing<T>(integration: &T)
     where
         T: ObjectStore + signer::Signer,
     {
@@ -1362,10 +1463,10 @@ mod tests {
     }
 
     #[cfg(any(feature = "aws", feature = "azure"))]
-    pub async fn tagging<F, Fut>(storage: Arc<dyn ObjectStore>, validate: bool, get_tags: F)
+    pub(crate) async fn tagging<F, Fut>(storage: Arc<dyn ObjectStore>, validate: bool, get_tags: F)
     where
         F: Fn(Path) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = Result<reqwest::Response>> + Send,
+        Fut: std::future::Future<Output = Result<client::HttpResponse>> + Send,
     {
         use bytes::Buf;
         use serde::Deserialize;
@@ -1431,7 +1532,7 @@ mod tests {
 
         for path in [path, multi_path, buf_path] {
             let resp = get_tags(path.clone()).await.unwrap();
-            let body = resp.bytes().await.unwrap();
+            let body = resp.into_body().bytes().await.unwrap();
 
             let mut resp: Tagging = quick_xml::de::from_reader(body.reader()).unwrap();
             resp.list.tags.sort_by(|a, b| a.key.cmp(&b.key));

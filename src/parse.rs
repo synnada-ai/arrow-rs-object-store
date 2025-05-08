@@ -15,21 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 use crate::local::LocalFileSystem;
 use crate::memory::InMemory;
 use crate::path::Path;
 use crate::ObjectStore;
-use snafu::Snafu;
 use url::Url;
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[snafu(display("Unable to recognise URL \"{}\"", url))]
+    #[error("Unable to recognise URL \"{}\"", url)]
     Unrecognised { url: Url },
 
-    #[snafu(context(false))]
-    Path { source: crate::path::Error },
+    #[error(transparent)]
+    Path {
+        #[from]
+        source: crate::path::Error,
+    },
 }
 
 impl From<Error> for super::Error {
@@ -179,7 +181,7 @@ where
     let path = Path::parse(path)?;
 
     let store = match scheme {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
         ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()) as _,
         ObjectStoreScheme::Memory => Box::new(InMemory::new()) as _,
         #[cfg(feature = "aws")]
@@ -199,7 +201,13 @@ where
             let url = &url[..url::Position::BeforePath];
             builder_opts!(crate::http::HttpBuilder, url, _options)
         }
-        #[cfg(not(all(feature = "aws", feature = "azure", feature = "gcp", feature = "http")))]
+        #[cfg(not(all(
+            feature = "aws",
+            feature = "azure",
+            feature = "gcp",
+            feature = "http",
+            not(target_arch = "wasm32")
+        )))]
         s => {
             return Err(super::Error::Generic {
                 store: "parse_url",
@@ -340,10 +348,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    #[cfg(all(feature = "http", not(target_arch = "wasm32")))]
     async fn test_url_http() {
         use crate::client::mock_server::MockServer;
-        use hyper::{header::USER_AGENT, Response};
+        use http::{header::USER_AGENT, Response};
 
         let server = MockServer::new().await;
 
