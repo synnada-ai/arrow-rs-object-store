@@ -814,7 +814,7 @@ struct UploadState {
 }
 
 impl LocalUpload {
-    pub fn new(src: PathBuf, dest: PathBuf, file: File, offset: u64) -> Self {
+    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File, offset: u64) -> Self {
         Self {
             state: Arc::new(UploadState {
                 dest,

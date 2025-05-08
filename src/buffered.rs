@@ -208,6 +208,8 @@ impl AsyncBufRead for BufReader {
     }
 }
 
+/// THIS STRUCT IS COMMON, MODIFIED BY ARAS
+///
 /// An async buffered writer compatible with the tokio IO traits
 ///
 /// This writer adaptively uses [`ObjectStore::put`] or
@@ -225,7 +227,9 @@ pub struct BufWriter {
     extensions: Option<::http::Extensions>,
     state: BufWriterState,
     store: Arc<dyn ObjectStore>,
+    /// THIS FIELD IS ARAS ONLY
     path: Path,
+    /// THIS FIELD IS ARAS ONLY
     actual_flush: bool,
 }
 
@@ -249,6 +253,7 @@ enum BufWriterState {
     Flush(BoxFuture<'static, crate::Result<()>>),
 }
 
+/// THIS ENUM IS COMMON, MODIFIED BY ARAS
 impl BufWriter {
     /// Create a new [`BufWriter`] from the provided [`ObjectStore`] and [`Path`]
     pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
@@ -360,7 +365,7 @@ impl BufWriter {
                             attributes: self.attributes.take().unwrap_or_default(),
                             tags: self.tags.take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
-                            copy_and_append: if actual_flush { true } else { false },
+                            copy_and_append: actual_flush,
                         };
                         let upload = self.store.put_multipart_opts(&path, opts).await?;
                         let mut chunked =
@@ -428,7 +433,7 @@ impl AsyncWrite for BufWriter {
                             attributes: self.attributes.take().unwrap_or_default(),
                             tags: self.tags.clone().take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
-                            copy_and_append: if actual_flush { true } else { false },
+                            copy_and_append: actual_flush,
                         };
                         let store = Arc::clone(&self.store);
                         self.state = BufWriterState::Prepare(Box::pin(async move {
@@ -496,6 +501,7 @@ impl AsyncWrite for BufWriter {
                             attributes: self.attributes.clone().take().unwrap_or_default(),
                             tags: self.tags.clone().take().unwrap_or_default(),
                             copy_and_append: true,
+                            extensions: self.extensions.take().unwrap_or_default(),
                         };
                         let store = Arc::clone(&self.store);
                         let cap = self.capacity;
@@ -505,7 +511,6 @@ impl AsyncWrite for BufWriter {
                             let upload = store.put_multipart_opts(&path, opts).await?;
                             Ok(WriteMultipart::new_with_chunk_size(upload, cap))
                         }));
-                    } else {
                     }
                 }
                 BufWriterState::Write(x) => {
