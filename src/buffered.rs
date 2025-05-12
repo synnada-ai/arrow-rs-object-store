@@ -432,7 +432,7 @@ impl AsyncWrite for BufWriter {
                         let path = std::mem::take(path);
                         let opts = PutMultipartOpts {
                             attributes: self.attributes.take().unwrap_or_default(),
-                            tags: self.tags.clone().take().unwrap_or_default(),
+                            tags: self.tags.take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
                             copy_and_append: actual_flush,
                         };
@@ -456,10 +456,75 @@ impl AsyncWrite for BufWriter {
 
     /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let actual_flush = self.actual_flush;
         loop {
-            let actual_flush = self.actual_flush;
-            if !actual_flush {
-                return match &mut self.state {
+            if actual_flush {
+                match &mut self.state {
+                    BufWriterState::Prepare(f) => {
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                    }
+                    BufWriterState::Write(x) => {
+                        if x.is_none() {
+                            return Poll::Ready(Ok(()));
+                        }
+
+                        let upload = x.take().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                "Cannot shutdown a writer that has already been shut down",
+                            )
+                        })?;
+
+                        self.state = BufWriterState::Flush(
+                            async move {
+                                upload.finish().await?;
+                                Ok(())
+                            }
+                                .boxed(),
+                        )
+                    }
+                    BufWriterState::PrepareAfterFlush(f) => {
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        return Poll::Ready(Ok(()));
+                    }
+                    BufWriterState::Buffer(p, b) => {
+                        let buf = std::mem::take(b);
+                        let path = std::mem::take(p);
+                        let opts = PutOptions {
+                            attributes: self.attributes.take().unwrap_or_default(),
+                            tags: self.tags.take().unwrap_or_default(),
+                            copy_and_append: true,
+                            ..Default::default()
+                        };
+                        let store = Arc::clone(&self.store);
+                        self.state = BufWriterState::Flush(Box::pin(async move {
+                            store.put_opts(&path, buf.into(), opts).await?;
+                            Ok(())
+                        }));
+                    }
+                    BufWriterState::Flush(f) => {
+                        if actual_flush {
+                            ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
+
+                            let opts = PutMultipartOpts {
+                                attributes: self.attributes.clone().take().unwrap_or_default(),
+                                tags: self.tags.clone().take().unwrap_or_default(),
+                                copy_and_append: true,
+                                extensions: self.extensions.take().unwrap_or_default(),
+                            };
+                            let store = Arc::clone(&self.store);
+                            let cap = self.capacity;
+                            let path = self.path.clone();
+
+                            self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
+                                let upload = store.put_multipart_opts(&path, opts).await?;
+                                Ok(WriteMultipart::new_with_chunk_size(upload, cap))
+                            }));
+                        }
+                    }
+                }
+            }else {
+                 return match &mut self.state {
                     BufWriterState::Write(_) | BufWriterState::Buffer(_, _) => Poll::Ready(Ok(())),
                     BufWriterState::Flush(_) => panic!("Already shut down"),
                     BufWriterState::Prepare(f) => {
@@ -467,78 +532,14 @@ impl AsyncWrite for BufWriter {
                         continue;
                     }
                     BufWriterState::PrepareAfterFlush(_) => {
-                        unreachable!("")
+                        unreachable!("Not expected to enter PrepareAfterFlush region in normal execution")
                     }
-                };
-            }
-
-            match &mut self.state {
-                BufWriterState::Prepare(f) => {
-                    self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
-                }
-                BufWriterState::PrepareAfterFlush(f) => {
-                    self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
-                    return Poll::Ready(Ok(()));
-                }
-                BufWriterState::Buffer(p, b) => {
-                    let buf = std::mem::take(b);
-                    let path = std::mem::take(p);
-                    let opts = PutOptions {
-                        attributes: self.attributes.take().unwrap_or_default(),
-                        tags: self.tags.take().unwrap_or_default(),
-                        copy_and_append: true,
-                        ..Default::default()
-                    };
-                    let store = Arc::clone(&self.store);
-                    self.state = BufWriterState::Flush(Box::pin(async move {
-                        store.put_opts(&path, buf.into(), opts).await?;
-                        Ok(())
-                    }));
-                }
-                BufWriterState::Flush(f) => {
-                    if actual_flush {
-                        ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
-
-                        let opts = PutMultipartOpts {
-                            attributes: self.attributes.clone().take().unwrap_or_default(),
-                            tags: self.tags.clone().take().unwrap_or_default(),
-                            copy_and_append: true,
-                            extensions: self.extensions.take().unwrap_or_default(),
-                        };
-                        let store = Arc::clone(&self.store);
-                        let cap = self.capacity;
-                        let path = self.path.clone();
-
-                        self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
-                            let upload = store.put_multipart_opts(&path, opts).await?;
-                            Ok(WriteMultipart::new_with_chunk_size(upload, cap))
-                        }));
-                    }
-                }
-                BufWriterState::Write(x) => {
-                    if x.is_none() {
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    let upload = x.take().ok_or_else(|| {
-                        std::io::Error::new(
-                            ErrorKind::InvalidInput,
-                            "Cannot shutdown a writer that has already been shut down",
-                        )
-                    })?;
-
-                    self.state = BufWriterState::Flush(
-                        async move {
-                            upload.finish().await?;
-                            Ok(())
-                        }
-                        .boxed(),
-                    )
                 }
             }
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             match &mut self.state {
@@ -847,6 +848,7 @@ mod tests {
         }
     }
 
+    // THIS TEST IS ARAS ONLY
     #[tokio::test]
     async fn test_values_in_order() {
         let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
