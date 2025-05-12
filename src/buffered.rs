@@ -241,6 +241,7 @@ impl std::fmt::Debug for BufWriter {
     }
 }
 
+/// THIS ENUM IS COMMON, MODIFIED BY ARAS
 enum BufWriterState {
     /// Buffer up to capacity bytes
     Buffer(Path, PutPayloadMut),
@@ -253,13 +254,14 @@ enum BufWriterState {
     Flush(BoxFuture<'static, crate::Result<()>>),
 }
 
-/// THIS ENUM IS COMMON, MODIFIED BY ARAS
 impl BufWriter {
     /// Create a new [`BufWriter`] from the provided [`ObjectStore`] and [`Path`]
     pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
         Self::with_capacity(store, path, 10 * 1024 * 1024)
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Create a new [`BufWriter`] from the provided [`ObjectStore`], [`Path`] and `capacity`
     pub fn with_capacity(store: Arc<dyn ObjectStore>, path: Path, capacity: usize) -> Self {
         Self {
@@ -275,6 +277,8 @@ impl BufWriter {
         }
     }
 
+    /// THIS METHOD IS ARAS ONLY
+    ///
     /// Get the actual flush status
     pub fn with_actual_flush(self, actual_flush: bool) -> Self {
         Self {
@@ -322,6 +326,8 @@ impl BufWriter {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Write data to the writer in [`Bytes`].
     ///
     /// Unlike [`AsyncWrite::poll_write`], `put` can write data without extra copying.
@@ -346,11 +352,7 @@ impl BufWriter {
                 // make it possible for users to call `put` before `poll_write` returns `Ready`.
                 //
                 // We allow such usage by `await` the future and continue the loop.
-                BufWriterState::Prepare(f) => {
-                    self.state = BufWriterState::Write(f.await?.into());
-                    continue;
-                }
-                BufWriterState::PrepareAfterFlush(f) => {
+                BufWriterState::Prepare(f)|    BufWriterState::PrepareAfterFlush(f)  => {
                     self.state = BufWriterState::Write(f.await?.into());
                     continue;
                 }
@@ -382,6 +384,8 @@ impl BufWriter {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Abort this writer, cleaning up any partially uploaded state
     ///
     /// # Panic
@@ -399,6 +403,7 @@ impl BufWriter {
 }
 
 impl AsyncWrite for BufWriter {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -406,8 +411,8 @@ impl AsyncWrite for BufWriter {
     ) -> Poll<Result<usize, Error>> {
         let cap = self.capacity;
         let max_concurrency = self.max_concurrency;
+        let actual_flush = self.actual_flush;
         loop {
-            let actual_flush = self.actual_flush;
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
                     ready!(write.poll_for_capacity(cx, max_concurrency))?;
@@ -417,11 +422,7 @@ impl AsyncWrite for BufWriter {
                 BufWriterState::Write(None) | BufWriterState::Flush(_) => {
                     panic!("Already shut down")
                 }
-                BufWriterState::Prepare(f) => {
-                    self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
-                    continue;
-                }
-                BufWriterState::PrepareAfterFlush(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                     continue;
                 }
@@ -453,6 +454,7 @@ impl AsyncWrite for BufWriter {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             let actual_flush = self.actual_flush;
