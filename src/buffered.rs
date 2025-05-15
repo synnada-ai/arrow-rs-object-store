@@ -352,7 +352,7 @@ impl BufWriter {
                 // make it possible for users to call `put` before `poll_write` returns `Ready`.
                 //
                 // We allow such usage by `await` the future and continue the loop.
-                BufWriterState::Prepare(f)|    BufWriterState::PrepareAfterFlush(f)  => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(f.await?.into());
                     continue;
                 }
@@ -480,7 +480,7 @@ impl AsyncWrite for BufWriter {
                                 upload.finish().await?;
                                 Ok(())
                             }
-                                .boxed(),
+                            .boxed(),
                         )
                     }
                     BufWriterState::PrepareAfterFlush(f) => {
@@ -523,8 +523,8 @@ impl AsyncWrite for BufWriter {
                         }
                     }
                 }
-            }else {
-                 return match &mut self.state {
+            } else {
+                return match &mut self.state {
                     BufWriterState::Write(_) | BufWriterState::Buffer(_, _) => Poll::Ready(Ok(())),
                     BufWriterState::Flush(_) => panic!("Already shut down"),
                     BufWriterState::Prepare(f) => {
@@ -532,9 +532,11 @@ impl AsyncWrite for BufWriter {
                         continue;
                     }
                     BufWriterState::PrepareAfterFlush(_) => {
-                        unreachable!("Not expected to enter PrepareAfterFlush region in normal execution")
+                        unreachable!(
+                            "Not expected to enter PrepareAfterFlush region in normal execution"
+                        )
                     }
-                }
+                };
             }
         }
     }

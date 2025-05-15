@@ -387,6 +387,7 @@ impl GoogleCloudStorageClient {
             tags: _,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let builder = self
@@ -450,6 +451,7 @@ impl GoogleCloudStorageClient {
             tags: _,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let response = self

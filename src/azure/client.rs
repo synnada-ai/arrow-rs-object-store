@@ -550,6 +550,7 @@ impl AzureClient {
             tags,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let builder = self
@@ -603,6 +604,7 @@ impl AzureClient {
             tags,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let blocks = parts

@@ -637,6 +637,7 @@ impl S3Client {
             tags,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let mut request = self.request(Method::POST, location);
