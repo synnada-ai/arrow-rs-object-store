@@ -335,7 +335,7 @@ impl ObjectStore for LocalFileSystem {
         let path = self.path_to_filesystem(location)?;
         maybe_spawn_blocking(move || {
             let (mut file, staging_path) = if opts.copy_and_append {
-                let (file, staging_path, _offset) = new_staged_upload_copy_and_append_from(&path)?;
+                let (file, staging_path, _offset) = new_staged_upload_copy_and_append(&path)?;
                 (file, staging_path)
             } else {
                 new_staged_upload(&path)?
@@ -403,7 +403,7 @@ impl ObjectStore for LocalFileSystem {
 
         let dest = self.path_to_filesystem(location)?;
         let (file, src, offset) = if opts.copy_and_append {
-            new_staged_upload_copy_and_append_from(&dest)?
+            new_staged_upload_copy_and_append(&dest)?
         } else {
             let (file, src) = new_staged_upload(&dest)?;
             (file, src, 0)
@@ -756,14 +756,21 @@ fn new_staged_upload(base: &std::path::Path) -> Result<(File, PathBuf)> {
 }
 
 /// THIS FUNCTION IS ARAS ONLY
-fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(File, PathBuf, u64)> {
+///
+/// Creates a new staging file by copying from `base` if it exists,
+/// and seeks to the end so we can append new data.
+fn new_staged_upload_copy_and_append(base: &std::path::Path) -> Result<(File, PathBuf, u64)> {
     let multipart_id = 1;
     loop {
         let suffix = multipart_id.to_string();
         let path = staged_upload_path(base, &suffix);
 
         let offset = if base.exists() {
-            let offset = std::fs::metadata(base).unwrap().len();
+            let metadata = std::fs::metadata(base).map_err(|source| Error::Metadata {
+                source: source.into(),
+                path: base.display().to_string(),
+            })?;
+            let offset = metadata.len();
 
             std::fs::copy(base, &path).map_err(|source| Error::UnableToCopyFile {
                 from: base.to_path_buf(),
@@ -779,13 +786,23 @@ fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(Fil
         let mut options = OpenOptions::new();
         match options.read(true).write(true).create(true).open(&path) {
             Ok(mut f) => {
-                let _ = f.seek(SeekFrom::Start(offset)).unwrap();
-
+                f.seek(SeekFrom::Start(offset)).map_err(|source| Error::Seek {
+                    source,
+                    path: path.clone(),
+                })?;
                 return Ok((f, path, offset));
             }
             Err(source) => match source.kind() {
-                ErrorKind::AlreadyExists => unreachable!(""),
-                ErrorKind::NotFound => create_parent_dirs(&path, source)?,
+                ErrorKind::AlreadyExists => {
+                    return Err(Error::AlreadyExists {
+                        path: path.to_string_lossy().to_string(),
+                        source,
+                    }
+                        .into())
+                }
+                ErrorKind::NotFound => {
+                    create_parent_dirs(&path, source)?;
+                }
                 _ => return Err(Error::UnableToOpenFile { source, path }.into()),
             },
         }

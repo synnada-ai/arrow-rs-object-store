@@ -615,7 +615,6 @@ mod tests {
     use crate::memory::InMemory;
     use crate::path::Path;
     use crate::{Attribute, GetOptions};
-
     use itertools::Itertools;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
