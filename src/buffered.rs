@@ -233,7 +233,7 @@ pub struct BufWriter {
     /// we lose that information. So, we need to keep it explicitly as well.
     path: Path,
     /// THIS FIELD IS ARAS ONLY
-    commit_on_flush: bool,
+    prepare_after_flush: bool,
 }
 
 impl std::fmt::Debug for BufWriter {
@@ -250,7 +250,7 @@ enum BufWriterState {
     Buffer(Path, PutPayloadMut),
     /// [`ObjectStore::put_multipart`]
     Prepare(BoxFuture<'static, crate::Result<WriteMultipart>>),
-    PrepareAppend(BoxFuture<'static, crate::Result<WriteMultipart>>),
+    PrepareAfterFlush(BoxFuture<'static, crate::Result<WriteMultipart>>),
     /// Write to a multipart upload
     Write(Option<WriteMultipart>),
     /// [`ObjectStore::put`]
@@ -276,16 +276,16 @@ impl BufWriter {
             extensions: None,
             state: BufWriterState::Buffer(path.clone(), PutPayloadMut::new()),
             path,
-            commit_on_flush: false,
+            prepare_after_flush: false,
         }
     }
 
     /// THIS METHOD IS ARAS ONLY
     ///
-    /// Get the commit on flush status
-    pub fn with_commit_on_flush(self, commit_on_flush: bool) -> Self {
+    /// Get the prepare after flush status
+    pub fn with_prepare_after_flush(self, prepare_after_flush: bool) -> Self {
         Self {
-            commit_on_flush,
+            prepare_after_flush: prepare_after_flush,
             ..self
         }
     }
@@ -338,7 +338,7 @@ impl BufWriter {
     /// This API is recommended while the data source generates [`Bytes`].
     pub async fn put(&mut self, bytes: Bytes) -> crate::Result<()> {
         loop {
-            let commit_on_flush = self.commit_on_flush;
+            let prepare_after_flush = self.prepare_after_flush;
 
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
@@ -355,7 +355,7 @@ impl BufWriter {
                 // make it possible for users to call `put` before `poll_write` returns `Ready`.
                 //
                 // We allow such usage by `await` the future and continue the loop.
-                BufWriterState::Prepare(f) | BufWriterState::PrepareAppend(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(f.await?.into());
                     continue;
                 }
@@ -370,7 +370,7 @@ impl BufWriter {
                             attributes: self.attributes.take().unwrap_or_default(),
                             tags: self.tags.take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
-                            copy_and_append: commit_on_flush,
+                            copy_and_append: prepare_after_flush,
                         };
                         let upload = self.store.put_multipart_opts(&path, opts).await?;
                         let mut chunked =
@@ -398,7 +398,7 @@ impl BufWriter {
         match &mut self.state {
             BufWriterState::Buffer(_, _)
             | BufWriterState::Prepare(_)
-            | BufWriterState::PrepareAppend(_) => Ok(()),
+            | BufWriterState::PrepareAfterFlush(_) => Ok(()),
             BufWriterState::Flush(_) => panic!("Already shut down"),
             BufWriterState::Write(x) => x.take().unwrap().abort().await,
         }
@@ -414,7 +414,7 @@ impl AsyncWrite for BufWriter {
     ) -> Poll<Result<usize, Error>> {
         let cap = self.capacity;
         let max_concurrency = self.max_concurrency;
-        let commit_on_flush = self.commit_on_flush;
+        let prepare_after_flush = self.prepare_after_flush;
         loop {
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
@@ -425,7 +425,7 @@ impl AsyncWrite for BufWriter {
                 BufWriterState::Write(None) | BufWriterState::Flush(_) => {
                     panic!("Already shut down")
                 }
-                BufWriterState::Prepare(f) | BufWriterState::PrepareAppend(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                     continue;
                 }
@@ -437,7 +437,7 @@ impl AsyncWrite for BufWriter {
                             attributes: self.attributes.take().unwrap_or_default(),
                             tags: self.tags.take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
-                            copy_and_append: commit_on_flush,
+                            copy_and_append: prepare_after_flush,
                         };
                         let store = Arc::clone(&self.store);
                         self.state = BufWriterState::Prepare(Box::pin(async move {
@@ -459,9 +459,9 @@ impl AsyncWrite for BufWriter {
 
     /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        let commit_on_flush = self.commit_on_flush;
+        let prepare_after_flush = self.prepare_after_flush;
         loop {
-            if commit_on_flush {
+            if prepare_after_flush {
                 match &mut self.state {
                     BufWriterState::Prepare(f) => {
                         self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
@@ -486,7 +486,7 @@ impl AsyncWrite for BufWriter {
                             .boxed(),
                         )
                     }
-                    BufWriterState::PrepareAppend(f) => {
+                    BufWriterState::PrepareAfterFlush(f) => {
                         self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                         return Poll::Ready(Ok(()));
                     }
@@ -506,7 +506,7 @@ impl AsyncWrite for BufWriter {
                         }));
                     }
                     BufWriterState::Flush(f) => {
-                        if commit_on_flush {
+                        if prepare_after_flush {
                             ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
 
                             let opts = PutMultipartOpts {
@@ -519,7 +519,7 @@ impl AsyncWrite for BufWriter {
                             let cap = self.capacity;
                             let path = self.path.clone();
 
-                            self.state = BufWriterState::PrepareAppend(Box::pin(async move {
+                            self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
                                 let upload = store.put_multipart_opts(&path, opts).await?;
                                 Ok(WriteMultipart::new_with_chunk_size(upload, cap))
                             }));
@@ -534,7 +534,7 @@ impl AsyncWrite for BufWriter {
                         self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                         continue;
                     }
-                    BufWriterState::PrepareAppend(_) => {
+                    BufWriterState::PrepareAfterFlush(_) => {
                         unreachable!(
                             "Not expected to enter PrepareAfterFlush region in normal execution"
                         )
@@ -551,7 +551,7 @@ impl AsyncWrite for BufWriter {
                 BufWriterState::Prepare(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                 }
-                BufWriterState::PrepareAppend(f) => {
+                BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                 }
                 BufWriterState::Buffer(p, b) => {
@@ -808,7 +808,7 @@ mod tests {
         let location = Path::parse(&path).unwrap();
 
         let buf_writer = BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 3)
-            .with_commit_on_flush(true);
+            .with_prepare_after_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
 
         let bytes = b"abc";
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(contents, "abcabcabc");
 
         let buf_writer =
-            BufWriter::new(Arc::clone(&object_store), location.clone()).with_commit_on_flush(true);
+            BufWriter::new(Arc::clone(&object_store), location.clone()).with_prepare_after_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
         let bytes = b"def";
         writer.write_all(bytes).await.unwrap();
@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(n, 15);
 
         let buf_writer =
-            BufWriter::new(Arc::clone(&object_store), location.clone()).with_commit_on_flush(true);
+            BufWriter::new(Arc::clone(&object_store), location.clone()).with_prepare_after_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
         let bytes = b"zzzz";
         writer.write_all(bytes).await.unwrap();
@@ -866,7 +866,7 @@ mod tests {
 
         let buf_writer =
             BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 1024)
-                .with_commit_on_flush(true);
+                .with_prepare_after_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
 
         let bytes = b"1\n2\n3\n";
