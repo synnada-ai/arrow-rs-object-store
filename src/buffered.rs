@@ -285,7 +285,7 @@ impl BufWriter {
     /// Get the prepare after flush status
     pub fn with_prepare_after_flush(self, prepare_after_flush: bool) -> Self {
         Self {
-            prepare_after_flush: prepare_after_flush,
+            prepare_after_flush,
             ..self
         }
     }
