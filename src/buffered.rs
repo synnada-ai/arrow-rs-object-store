@@ -518,30 +518,30 @@ impl AsyncWrite for BufWriter {
                                 upload.finish().await?;
                                 Ok(())
                             }
-                                .boxed(),
+                            .boxed(),
                         );
 
                         // Re-loop to poll the flush future
                         continue;
                     }
                     BufWriterState::Flush(f) => {
-                            ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
+                        ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
 
-                            // After flushing, prepare the next multipart session
-                            let opts = PutMultipartOpts {
-                                attributes: self.attributes.clone().take().unwrap_or_default(),
-                                tags: self.tags.clone().take().unwrap_or_default(),
-                                copy_and_append: true,
-                                extensions: self.extensions.take().unwrap_or_default(),
-                            };
-                            let store = Arc::clone(&self.store);
-                            let cap = self.capacity;
-                            let path = self.path.clone();
+                        // After flushing, prepare the next multipart session
+                        let opts = PutMultipartOpts {
+                            attributes: self.attributes.clone().take().unwrap_or_default(),
+                            tags: self.tags.clone().take().unwrap_or_default(),
+                            copy_and_append: true,
+                            extensions: self.extensions.take().unwrap_or_default(),
+                        };
+                        let store = Arc::clone(&self.store);
+                        let cap = self.capacity;
+                        let path = self.path.clone();
 
-                            self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
-                                let upload = store.put_multipart_opts(&path, opts).await?;
-                                Ok(WriteMultipart::new_with_chunk_size(upload, cap))
-                            }));
+                        self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
+                            let upload = store.put_multipart_opts(&path, opts).await?;
+                            Ok(WriteMultipart::new_with_chunk_size(upload, cap))
+                        }));
 
                         // Re-loop to poll the prepare-after-flush future
                         continue;
@@ -832,8 +832,8 @@ mod tests {
         let contents = read_file_contents(&path).unwrap();
         assert_eq!(contents, "abcabcabc");
 
-        let buf_writer =
-            BufWriter::new(Arc::clone(&object_store), location.clone()).with_prepare_after_flush(true);
+        let buf_writer = BufWriter::new(Arc::clone(&object_store), location.clone())
+            .with_prepare_after_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
         let bytes = b"def";
         writer.write_all(bytes).await.unwrap();
@@ -849,8 +849,8 @@ mod tests {
         let n = reader.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(n, 15);
 
-        let buf_writer =
-            BufWriter::new(Arc::clone(&object_store), location.clone()).with_prepare_after_flush(true);
+        let buf_writer = BufWriter::new(Arc::clone(&object_store), location.clone())
+            .with_prepare_after_flush(true);
         let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
         let bytes = b"zzzz";
         writer.write_all(bytes).await.unwrap();

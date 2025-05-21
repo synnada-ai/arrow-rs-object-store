@@ -786,10 +786,11 @@ fn new_staged_upload_copy_and_append(base: &std::path::Path) -> Result<(File, Pa
         let mut options = OpenOptions::new();
         match options.read(true).write(true).create(true).open(&path) {
             Ok(mut f) => {
-                f.seek(SeekFrom::Start(offset)).map_err(|source| Error::Seek {
-                    source,
-                    path: path.clone(),
-                })?;
+                f.seek(SeekFrom::Start(offset))
+                    .map_err(|source| Error::Seek {
+                        source,
+                        path: path.clone(),
+                    })?;
                 return Ok((f, path, offset));
             }
             Err(source) => match source.kind() {
@@ -798,7 +799,7 @@ fn new_staged_upload_copy_and_append(base: &std::path::Path) -> Result<(File, Pa
                         path: path.to_string_lossy().to_string(),
                         source,
                     }
-                        .into())
+                    .into())
                 }
                 ErrorKind::NotFound => {
                     create_parent_dirs(&path, source)?;
