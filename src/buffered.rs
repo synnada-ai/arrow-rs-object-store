@@ -529,8 +529,8 @@ impl AsyncWrite for BufWriter {
 
                         // After flushing, prepare the next multipart session
                         let opts = PutMultipartOpts {
-                            attributes: self.attributes.clone().take().unwrap_or_default(),
-                            tags: self.tags.clone().take().unwrap_or_default(),
+                            attributes: self.attributes.clone().unwrap_or_default(),
+                            tags: self.tags.clone().unwrap_or_default(),
                             copy_and_append: true,
                             extensions: self.extensions.take().unwrap_or_default(),
                         };
