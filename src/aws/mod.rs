@@ -157,6 +157,7 @@ impl Signer for AmazonS3 {
 
 #[async_trait]
 impl ObjectStore for AmazonS3 {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     async fn put_opts(
         &self,
         location: &Path,
@@ -168,6 +169,7 @@ impl ObjectStore for AmazonS3 {
             tags,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let request = self
