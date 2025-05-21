@@ -67,7 +67,7 @@ static UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 static STREAMING_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
 /// A set of AWS security credentials
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct AwsCredential {
     /// AWS_ACCESS_KEY_ID
     pub key_id: String,
@@ -75,6 +75,16 @@ pub struct AwsCredential {
     pub secret_key: String,
     /// AWS_SESSION_TOKEN
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for AwsCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredential")
+            .field("key_id", &self.key_id)
+            .field("secret_key", &"******")
+            .field("token", &self.token.as_ref().map(|_| "******"))
+            .finish()
+    }
 }
 
 impl AwsCredential {
@@ -719,6 +729,73 @@ async fn task_credential(
     })
 }
 
+/// EKS Pod Identity credential provider.
+///
+/// Uses the endpoint in `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+/// and the bearer token in `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
+/// to fetch ephemeral AWS credentials from an EKS pod.
+#[derive(Debug)]
+pub(crate) struct EKSPodCredentialProvider {
+    pub url: String,
+    pub token_file: String,
+    pub retry: RetryConfig,
+    pub client: HttpClient,
+    pub cache: TokenCache<Arc<AwsCredential>>,
+}
+
+#[async_trait]
+impl CredentialProvider for EKSPodCredentialProvider {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> Result<Arc<AwsCredential>> {
+        self.cache
+            .get_or_insert_with(|| {
+                eks_credential(&self.client, &self.retry, &self.url, &self.token_file)
+            })
+            .await
+            .map_err(|source| crate::Error::Generic {
+                store: STORE,
+                source,
+            })
+    }
+}
+
+/// Performs the actual credential retrieval and parsing for `EKSPodCredentialProvider`.
+///
+/// <https://mozillazg.com/2023/12/security-deep-dive-into-aws-eks-pod-identity-feature-en.html>
+async fn eks_credential(
+    client: &HttpClient,
+    retry: &RetryConfig,
+    url: &str,
+    token_file: &str,
+) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
+    // Spawn IO to blocking tokio pool if running in tokio context
+    let token = match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            let path = token_file.to_string();
+            runtime
+                .spawn_blocking(move || std::fs::read_to_string(&path))
+                .await?
+        }
+        Err(_) => std::fs::read_to_string(token_file),
+    }
+    .map_err(|e| format!("Failed to read EKS token file '{token_file}': {e}"))?;
+
+    let mut req = client.request(Method::GET, url);
+    req = req.header("Authorization", token);
+
+    // The JSON from the EKS credential endpoint has the same shape as ECS task credentials
+    let creds: InstanceCredentials = req.send_retry(retry).await?.into_body().json().await?;
+
+    let now = Utc::now();
+    let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+
+    Ok(TemporaryToken {
+        token: Arc::new(creds.into()),
+        expiry: Some(Instant::now() + ttl),
+    })
+}
+
 /// A session provider as used by S3 Express One Zone
 ///
 /// <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateSession.html>
@@ -773,6 +850,7 @@ struct CreateSessionOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aws::{AmazonS3Builder, AmazonS3ConfigKey};
     use crate::client::mock_server::MockServer;
     use crate::client::HttpClient;
     use http::Response;
@@ -1155,5 +1233,64 @@ mod tests {
         instance_creds(&client, &retry_config, endpoint, false)
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_eks_pod_credential_provider() {
+        use crate::client::mock_server::MockServer;
+        use http::Response;
+        use std::fs::File;
+        use std::io::Write;
+
+        let mock_server = MockServer::new().await;
+
+        mock_server.push(Response::new(
+            r#"{
+            "AccessKeyId": "TEST_KEY",
+            "SecretAccessKey": "TEST_SECRET",
+            "Token": "TEST_SESSION_TOKEN",
+            "Expiration": "2100-01-01T00:00:00Z"
+        }"#
+            .to_string(),
+        ));
+
+        let token_file = tempfile::NamedTempFile::new().expect("cannot create temp file");
+        let path = token_file.path().to_string_lossy().into_owned();
+        let mut f = File::create(token_file.path()).unwrap();
+        write!(f, "TEST_BEARER_TOKEN").unwrap();
+
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("some-bucket")
+            .with_config(
+                AmazonS3ConfigKey::ContainerCredentialsFullUri,
+                mock_server.url(),
+            )
+            .with_config(AmazonS3ConfigKey::ContainerAuthorizationTokenFile, &path);
+
+        let s3 = builder.build().unwrap();
+
+        let cred = s3.client.config.credentials.get_credential().await.unwrap();
+
+        assert_eq!(cred.key_id, "TEST_KEY");
+        assert_eq!(cred.secret_key, "TEST_SECRET");
+        assert_eq!(cred.token.as_deref(), Some("TEST_SESSION_TOKEN"));
+    }
+
+    #[test]
+    fn test_output_masks_all_fields() {
+        let cred = AwsCredential {
+            key_id: "AKIAXXX".to_string(),
+            secret_key: "super_secret".to_string(),
+            token: Some("temp_token".to_string()),
+        };
+
+        let debug_output = format!("{:?}", cred);
+
+        assert!(debug_output.contains("key_id: \"AKIAXXX\""));
+        assert!(debug_output.contains("secret_key: \"******\""));
+        assert!(debug_output.contains("token: Some(\"******\")"));
+
+        assert!(!debug_output.contains("super_secret"));
+        assert!(!debug_output.contains("temp_token"));
     }
 }

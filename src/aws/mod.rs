@@ -198,6 +198,7 @@ impl ObjectStore for AmazonS3 {
                     r => r,
                 }
             }
+            #[allow(deprecated)]
             (PutMode::Create, S3ConditionalPut::Dynamo(d)) => {
                 d.conditional_op(&self.client, location, None, move || request.do_put())
                     .await
@@ -229,6 +230,7 @@ impl ObjectStore for AmazonS3 {
                             r => r,
                         }
                     }
+                    #[allow(deprecated)]
                     S3ConditionalPut::Dynamo(d) => {
                         d.conditional_op(&self.client, location, Some(&etag), move || {
                             request.do_put()
@@ -368,6 +370,7 @@ impl ObjectStore for AmazonS3 {
 
                 return res;
             }
+            #[allow(deprecated)]
             Some(S3CopyIfNotExists::Dynamo(lock)) => {
                 return lock.copy_if_not_exists(&self.client, from, to).await
             }
@@ -499,6 +502,7 @@ impl MultipartStore for AmazonS3 {
 mod tests {
     use super::*;
     use crate::client::get::GetClient;
+    use crate::client::SpawnedReqwestConnector;
     use crate::integration::*;
     use crate::tests::*;
     use crate::ClientOptions;
@@ -512,7 +516,9 @@ mod tests {
     async fn write_multipart_file_with_signature() {
         maybe_skip_integration!();
 
+        let bucket = "test-bucket-for-checksum";
         let store = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
             .with_checksum_algorithm(Checksum::SHA256)
             .build()
             .unwrap();
@@ -624,6 +630,7 @@ mod tests {
         put_get_delete_list(&integration).await;
 
         match &integration.client.config.copy_if_not_exists {
+            #[allow(deprecated)]
             Some(S3CopyIfNotExists::Dynamo(d)) => dynamo::integration_test(&integration, d).await,
             _ => eprintln!("Skipping dynamo integration test - dynamo not configured"),
         };
@@ -821,5 +828,58 @@ mod tests {
 
             store.delete(location).await.unwrap();
         }
+    }
+
+    /// Integration test that ensures I/O is done on an alternate threadpool
+    /// when using the `SpawnedReqwestConnector`.
+    #[test]
+    fn s3_alternate_threadpool_spawned_request_connector() {
+        maybe_skip_integration!();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Runtime with I/O enabled
+        let io_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all() // <-- turns on IO
+            .build()
+            .unwrap();
+
+        // Runtime without I/O enabled
+        let non_io_runtime = tokio::runtime::Builder::new_current_thread()
+            // note: no call to enable_all
+            .build()
+            .unwrap();
+
+        // run the io runtime in a different thread
+        let io_handle = io_runtime.handle().clone();
+        let thread_handle = std::thread::spawn(move || {
+            io_runtime.block_on(async move {
+                shutdown_rx.await.unwrap();
+            });
+        });
+
+        let store = AmazonS3Builder::from_env()
+            // use different bucket to avoid collisions with other tests
+            .with_bucket_name("test-bucket-for-spawn")
+            .with_http_connector(SpawnedReqwestConnector::new(io_handle))
+            .build()
+            .unwrap();
+
+        // run a request on the non io runtime -- will fail if the connector
+        // does not spawn the request to the io runtime
+        non_io_runtime
+            .block_on(async move {
+                let path = Path::from("alternate_threadpool/test.txt");
+                store.delete(&path).await.ok(); // remove the file if it exists from prior runs
+                store.put(&path, "foo".into()).await?;
+                let res = store.get(&path).await?.bytes().await?;
+                assert_eq!(res.as_ref(), b"foo");
+                store.delete(&path).await?; // cleanup
+                Ok(()) as Result<()>
+            })
+            .expect("failed to run request on non io runtime");
+
+        // shutdown the io runtime and thread
+        shutdown_tx.send(()).ok();
+        thread_handle.join().expect("runtime thread panicked");
     }
 }

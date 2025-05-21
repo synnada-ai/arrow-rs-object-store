@@ -106,7 +106,7 @@ distribution servers.
 
 While the official release artifact is a signed tarball, we also tag the commit it was created for convenience and code archaeology.
 
-For `object_store` releases, use a string such as `object_store_0.4.0` as the `<version>`.
+Use a string such as `v0.4.0` as the `<version>`.
 
 Create and push the tag thusly:
 
@@ -126,7 +126,7 @@ Pick numbers in sequential order, with `1` for `rc1`, `2` for `rc2`, etc.
 Run `create-tarball.sh` with the `<version>` tag and `<rc>` and you found in previous steps.
 
 ```shell
-./object_store/dev/release/create-tarball.sh 0.11.1 1
+./dev/release/create-tarball.sh 0.11.1 1
 ```
 
 The `create-tarball.sh` script
