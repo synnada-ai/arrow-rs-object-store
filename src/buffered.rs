@@ -461,10 +461,45 @@ impl AsyncWrite for BufWriter {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let prepare_after_flush = self.prepare_after_flush;
         loop {
-            if prepare_after_flush {
-                match &mut self.state {
+            if !prepare_after_flush {
+                return match &mut self.state {
+                    BufWriterState::Write(_) | BufWriterState::Buffer(_, _) => Poll::Ready(Ok(())),
+                    BufWriterState::Flush(_) => panic!("Already shut down"),
                     BufWriterState::Prepare(f) => {
                         self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        continue;
+                    }
+                    BufWriterState::PrepareAfterFlush(_) => {
+                        unreachable!(
+                            "Not expected to enter PrepareAfterFlush region in normal execution"
+                        )
+                    }
+                };
+            } else {
+                // prepare_after_flush is true: do commit-aware flushing
+                match &mut self.state {
+                    BufWriterState::Buffer(p, b) => {
+                        let buf = std::mem::take(b);
+                        let path = std::mem::take(p);
+                        let opts = PutOptions {
+                            attributes: self.attributes.take().unwrap_or_default(),
+                            tags: self.tags.take().unwrap_or_default(),
+                            copy_and_append: true,
+                            ..Default::default()
+                        };
+
+                        let store = Arc::clone(&self.store);
+                        self.state = BufWriterState::Flush(Box::pin(async move {
+                            store.put_opts(&path, buf.into(), opts).await?;
+                            Ok(())
+                        }));
+
+                        // Re-loop to poll the flush future
+                        continue;
+                    }
+                    BufWriterState::Prepare(f) => {
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        continue;
                     }
                     BufWriterState::Write(x) => {
                         if x.is_none() {
@@ -483,32 +518,16 @@ impl AsyncWrite for BufWriter {
                                 upload.finish().await?;
                                 Ok(())
                             }
-                            .boxed(),
-                        )
-                    }
-                    BufWriterState::PrepareAfterFlush(f) => {
-                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
-                        return Poll::Ready(Ok(()));
-                    }
-                    BufWriterState::Buffer(p, b) => {
-                        let buf = std::mem::take(b);
-                        let path = std::mem::take(p);
-                        let opts = PutOptions {
-                            attributes: self.attributes.take().unwrap_or_default(),
-                            tags: self.tags.take().unwrap_or_default(),
-                            copy_and_append: true,
-                            ..Default::default()
-                        };
-                        let store = Arc::clone(&self.store);
-                        self.state = BufWriterState::Flush(Box::pin(async move {
-                            store.put_opts(&path, buf.into(), opts).await?;
-                            Ok(())
-                        }));
+                                .boxed(),
+                        );
+
+                        // Re-loop to poll the flush future
+                        continue;
                     }
                     BufWriterState::Flush(f) => {
-                        if prepare_after_flush {
                             ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
 
+                            // After flushing, prepare the next multipart session
                             let opts = PutMultipartOpts {
                                 attributes: self.attributes.clone().take().unwrap_or_default(),
                                 tags: self.tags.clone().take().unwrap_or_default(),
@@ -523,23 +542,16 @@ impl AsyncWrite for BufWriter {
                                 let upload = store.put_multipart_opts(&path, opts).await?;
                                 Ok(WriteMultipart::new_with_chunk_size(upload, cap))
                             }));
-                        }
-                    }
-                }
-            } else {
-                return match &mut self.state {
-                    BufWriterState::Write(_) | BufWriterState::Buffer(_, _) => Poll::Ready(Ok(())),
-                    BufWriterState::Flush(_) => panic!("Already shut down"),
-                    BufWriterState::Prepare(f) => {
-                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+
+                        // Re-loop to poll the prepare-after-flush future
                         continue;
                     }
-                    BufWriterState::PrepareAfterFlush(_) => {
-                        unreachable!(
-                            "Not expected to enter PrepareAfterFlush region in normal execution"
-                        )
+                    BufWriterState::PrepareAfterFlush(f) => {
+                        // Finish preparing the next multipart upload after flushing
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        return Poll::Ready(Ok(()));
                     }
-                };
+                }
             }
         }
     }
@@ -548,10 +560,7 @@ impl AsyncWrite for BufWriter {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             match &mut self.state {
-                BufWriterState::Prepare(f) => {
-                    self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
-                }
-                BufWriterState::PrepareAfterFlush(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                 }
                 BufWriterState::Buffer(p, b) => {
