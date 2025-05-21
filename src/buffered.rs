@@ -233,6 +233,10 @@ pub struct BufWriter {
     /// we lose that information. So, we need to keep it explicitly as well.
     path: Path,
     /// THIS FIELD IS ARAS ONLY
+    ///
+    /// If set to `true`, after calling `flush`, the writer will immediately
+    /// prepare a new multipart upload. This enables continuous streaming writes
+    /// by ensuring a fresh multipart session is ready after each flush.
     prepare_after_flush: bool,
 }
 
@@ -250,6 +254,11 @@ enum BufWriterState {
     Buffer(Path, PutPayloadMut),
     /// [`ObjectStore::put_multipart`]
     Prepare(BoxFuture<'static, crate::Result<WriteMultipart>>),
+    /// Prepare a new multipart upload *after* a flush has completed.
+    ///
+    /// This state is only entered if `prepare_after_flush` is `true`, and ensures
+    /// a fresh multipart upload is ready immediately after flushing, enabling
+    /// uninterrupted streaming of data across flush boundaries.
     PrepareAfterFlush(BoxFuture<'static, crate::Result<WriteMultipart>>),
     /// Write to a multipart upload
     Write(Option<WriteMultipart>),
