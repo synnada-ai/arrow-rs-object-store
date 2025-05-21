@@ -375,6 +375,7 @@ impl GoogleCloudStorageClient {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     pub(crate) async fn put(
         &self,
         path: &Path,
@@ -440,6 +441,8 @@ impl GoogleCloudStorageClient {
         })
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Initiate a multipart upload <https://cloud.google.com/storage/docs/xml-api/post-object-multipart>
     pub(crate) async fn multipart_initiate(
         &self,

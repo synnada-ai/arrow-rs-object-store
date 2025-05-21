@@ -604,11 +604,12 @@ mod tests {
     use crate::path::Path;
     use crate::{Attribute, GetOptions};
 
-    use std::fs::File;
-    use std::io::Read;
-
     use itertools::Itertools;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    // THESE IMPORTS ARE ARAS ONLY
+    use std::fs::File;
+    use std::io::Read;
 
     #[tokio::test]
     async fn test_buf_reader() {
@@ -794,6 +795,7 @@ mod tests {
         assert_eq!(response.bytes().await.unwrap(), (0..40).collect_vec());
     }
 
+    /// THIS TEST IS ARAS ONLY
     #[tokio::test]
     async fn test_buf_writer_with_append_only_local_file() {
         let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
@@ -850,7 +852,7 @@ mod tests {
         }
     }
 
-    // THIS TEST IS ARAS ONLY
+    /// THIS TEST IS ARAS ONLY
     #[tokio::test]
     async fn test_values_in_order() {
         let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;

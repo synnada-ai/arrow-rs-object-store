@@ -1147,6 +1147,8 @@ impl From<PutResult> for UpdateVersion {
     }
 }
 
+/// THIS STRUCT IS COMMON, MODIFIED BY ARAS
+///
 /// Options for a put request
 #[derive(Debug, Clone, Default)]
 pub struct PutOptions {
@@ -1167,11 +1169,14 @@ pub struct PutOptions {
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
     pub extensions: ::http::Extensions,
-    /// Copy file and append from it
+    /// THIS FIELD IS ARAS ONLY
+    ///
+    /// Copy file and append to it during checkpointing
     pub copy_and_append: bool,
 }
 
 impl PartialEq<Self> for PutOptions {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn eq(&self, other: &Self) -> bool {
         let Self {
             mode,
@@ -1223,6 +1228,8 @@ impl From<Attributes> for PutOptions {
     }
 }
 
+/// THIS STRUCT IS COMMON, MODIFIED BY ARAS
+///
 /// Options for [`ObjectStore::put_multipart_opts`]
 #[derive(Debug, Clone, Default)]
 pub struct PutMultipartOpts {
@@ -1241,11 +1248,14 @@ pub struct PutMultipartOpts {
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
     pub extensions: ::http::Extensions,
-    /// Copy file and append from it
+    /// THIS FIELD IS ARAS ONLY
+    ///
+    /// Copy file and append to it during checkpointing
     pub copy_and_append: bool,
 }
 
 impl PartialEq<Self> for PutMultipartOpts {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn eq(&self, other: &Self) -> bool {
         let Self {
             tags,

@@ -317,6 +317,7 @@ fn is_valid_file_path(path: &Path) -> bool {
 
 #[async_trait]
 impl ObjectStore for LocalFileSystem {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     async fn put_opts(
         &self,
         location: &Path,
@@ -390,6 +391,7 @@ impl ObjectStore for LocalFileSystem {
         .await
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -753,6 +755,7 @@ fn new_staged_upload(base: &std::path::Path) -> Result<(File, PathBuf)> {
     }
 }
 
+/// THIS FUNCTION IS ARAS ONLY
 fn new_staged_upload_copy_and_append_from(base: &std::path::Path) -> Result<(File, PathBuf, u64)> {
     let multipart_id = 1;
     loop {
@@ -814,6 +817,7 @@ struct UploadState {
 }
 
 impl LocalUpload {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File, offset: u64) -> Self {
         Self {
             state: Arc::new(UploadState {

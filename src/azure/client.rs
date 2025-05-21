@@ -538,6 +538,8 @@ impl AzureClient {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Make an Azure PUT request <https://docs.microsoft.com/en-us/rest/api/storageservices/put-blob>
     pub(crate) async fn put_blob(
         &self,
@@ -593,6 +595,8 @@ impl AzureClient {
         Ok(PartId { content_id })
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// PUT a block list <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-list>
     pub(crate) async fn put_block_list(
         &self,
