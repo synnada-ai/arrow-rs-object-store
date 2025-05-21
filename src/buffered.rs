@@ -807,6 +807,7 @@ mod tests {
     }
 
     /// THIS TEST IS ARAS ONLY
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_buf_writer_with_append_only_local_file() {
         let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
@@ -864,6 +865,7 @@ mod tests {
     }
 
     /// THIS TEST IS ARAS ONLY
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_values_in_order() {
         let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
