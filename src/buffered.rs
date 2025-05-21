@@ -208,6 +208,8 @@ impl AsyncBufRead for BufReader {
     }
 }
 
+/// THIS STRUCT IS COMMON, MODIFIED BY ARAS
+///
 /// An async buffered writer compatible with the tokio IO traits
 ///
 /// This writer adaptively uses [`ObjectStore::put`] or
@@ -225,6 +227,17 @@ pub struct BufWriter {
     extensions: Option<::http::Extensions>,
     state: BufWriterState,
     store: Arc<dyn ObjectStore>,
+    /// THIS FIELD IS ARAS ONLY
+    ///
+    /// The path information is also in BufWriterState, but after its state changes,
+    /// we lose that information. So, we need to keep it explicitly as well.
+    path: Path,
+    /// THIS FIELD IS ARAS ONLY
+    ///
+    /// If set to `true`, after calling `flush`, the writer will immediately
+    /// prepare a new multipart upload. This enables continuous streaming writes
+    /// by ensuring a fresh multipart session is ready after each flush.
+    prepare_after_flush: bool,
 }
 
 impl std::fmt::Debug for BufWriter {
@@ -235,11 +248,18 @@ impl std::fmt::Debug for BufWriter {
     }
 }
 
+/// THIS ENUM IS COMMON, MODIFIED BY ARAS
 enum BufWriterState {
     /// Buffer up to capacity bytes
     Buffer(Path, PutPayloadMut),
     /// [`ObjectStore::put_multipart`]
     Prepare(BoxFuture<'static, crate::Result<WriteMultipart>>),
+    /// Prepare a new multipart upload *after* a flush has completed.
+    ///
+    /// This state is only entered if `prepare_after_flush` is `true`, and ensures
+    /// a fresh multipart upload is ready immediately after flushing, enabling
+    /// uninterrupted streaming of data across flush boundaries.
+    PrepareAfterFlush(BoxFuture<'static, crate::Result<WriteMultipart>>),
     /// Write to a multipart upload
     Write(Option<WriteMultipart>),
     /// [`ObjectStore::put`]
@@ -252,6 +272,8 @@ impl BufWriter {
         Self::with_capacity(store, path, 10 * 1024 * 1024)
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Create a new [`BufWriter`] from the provided [`ObjectStore`], [`Path`] and `capacity`
     pub fn with_capacity(store: Arc<dyn ObjectStore>, path: Path, capacity: usize) -> Self {
         Self {
@@ -261,7 +283,19 @@ impl BufWriter {
             attributes: None,
             tags: None,
             extensions: None,
-            state: BufWriterState::Buffer(path, PutPayloadMut::new()),
+            state: BufWriterState::Buffer(path.clone(), PutPayloadMut::new()),
+            path,
+            prepare_after_flush: false,
+        }
+    }
+
+    /// THIS METHOD IS ARAS ONLY
+    ///
+    /// Get the prepare after flush status
+    pub fn with_prepare_after_flush(self, prepare_after_flush: bool) -> Self {
+        Self {
+            prepare_after_flush,
+            ..self
         }
     }
 
@@ -304,6 +338,8 @@ impl BufWriter {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Write data to the writer in [`Bytes`].
     ///
     /// Unlike [`AsyncWrite::poll_write`], `put` can write data without extra copying.
@@ -311,6 +347,8 @@ impl BufWriter {
     /// This API is recommended while the data source generates [`Bytes`].
     pub async fn put(&mut self, bytes: Bytes) -> crate::Result<()> {
         loop {
+            let prepare_after_flush = self.prepare_after_flush;
+
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
                     write.wait_for_capacity(self.max_concurrency).await?;
@@ -326,7 +364,7 @@ impl BufWriter {
                 // make it possible for users to call `put` before `poll_write` returns `Ready`.
                 //
                 // We allow such usage by `await` the future and continue the loop.
-                BufWriterState::Prepare(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(f.await?.into());
                     continue;
                 }
@@ -341,6 +379,7 @@ impl BufWriter {
                             attributes: self.attributes.take().unwrap_or_default(),
                             tags: self.tags.take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
+                            copy_and_append: prepare_after_flush,
                         };
                         let upload = self.store.put_multipart_opts(&path, opts).await?;
                         let mut chunked =
@@ -357,6 +396,8 @@ impl BufWriter {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
+    ///
     /// Abort this writer, cleaning up any partially uploaded state
     ///
     /// # Panic
@@ -364,7 +405,9 @@ impl BufWriter {
     /// Panics if this writer has already been shutdown or aborted
     pub async fn abort(&mut self) -> crate::Result<()> {
         match &mut self.state {
-            BufWriterState::Buffer(_, _) | BufWriterState::Prepare(_) => Ok(()),
+            BufWriterState::Buffer(_, _)
+            | BufWriterState::Prepare(_)
+            | BufWriterState::PrepareAfterFlush(_) => Ok(()),
             BufWriterState::Flush(_) => panic!("Already shut down"),
             BufWriterState::Write(x) => x.take().unwrap().abort().await,
         }
@@ -372,6 +415,7 @@ impl BufWriter {
 }
 
 impl AsyncWrite for BufWriter {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -379,6 +423,7 @@ impl AsyncWrite for BufWriter {
     ) -> Poll<Result<usize, Error>> {
         let cap = self.capacity;
         let max_concurrency = self.max_concurrency;
+        let prepare_after_flush = self.prepare_after_flush;
         loop {
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
@@ -389,7 +434,7 @@ impl AsyncWrite for BufWriter {
                 BufWriterState::Write(None) | BufWriterState::Flush(_) => {
                     panic!("Already shut down")
                 }
-                BufWriterState::Prepare(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                     continue;
                 }
@@ -401,6 +446,7 @@ impl AsyncWrite for BufWriter {
                             attributes: self.attributes.take().unwrap_or_default(),
                             tags: self.tags.take().unwrap_or_default(),
                             extensions: self.extensions.take().unwrap_or_default(),
+                            copy_and_append: prepare_after_flush,
                         };
                         let store = Arc::clone(&self.store);
                         self.state = BufWriterState::Prepare(Box::pin(async move {
@@ -420,23 +466,110 @@ impl AsyncWrite for BufWriter {
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let prepare_after_flush = self.prepare_after_flush;
         loop {
-            return match &mut self.state {
-                BufWriterState::Write(_) | BufWriterState::Buffer(_, _) => Poll::Ready(Ok(())),
-                BufWriterState::Flush(_) => panic!("Already shut down"),
-                BufWriterState::Prepare(f) => {
-                    self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
-                    continue;
+            if !prepare_after_flush {
+                return match &mut self.state {
+                    BufWriterState::Write(_) | BufWriterState::Buffer(_, _) => Poll::Ready(Ok(())),
+                    BufWriterState::Flush(_) => panic!("Already shut down"),
+                    BufWriterState::Prepare(f) => {
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        continue;
+                    }
+                    BufWriterState::PrepareAfterFlush(_) => {
+                        unreachable!(
+                            "Not expected to enter PrepareAfterFlush region in normal execution"
+                        )
+                    }
+                };
+            } else {
+                // prepare_after_flush is true: do commit-aware flushing
+                match &mut self.state {
+                    BufWriterState::Buffer(p, b) => {
+                        let buf = std::mem::take(b);
+                        let path = std::mem::take(p);
+                        let opts = PutOptions {
+                            attributes: self.attributes.take().unwrap_or_default(),
+                            tags: self.tags.take().unwrap_or_default(),
+                            copy_and_append: true,
+                            ..Default::default()
+                        };
+
+                        let store = Arc::clone(&self.store);
+                        self.state = BufWriterState::Flush(Box::pin(async move {
+                            store.put_opts(&path, buf.into(), opts).await?;
+                            Ok(())
+                        }));
+
+                        // Re-loop to poll the flush future
+                        continue;
+                    }
+                    BufWriterState::Prepare(f) => {
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        continue;
+                    }
+                    BufWriterState::Write(x) => {
+                        if x.is_none() {
+                            return Poll::Ready(Ok(()));
+                        }
+
+                        let upload = x.take().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                "Cannot shutdown a writer that has already been shut down",
+                            )
+                        })?;
+
+                        self.state = BufWriterState::Flush(
+                            async move {
+                                upload.finish().await?;
+                                Ok(())
+                            }
+                            .boxed(),
+                        );
+
+                        // Re-loop to poll the flush future
+                        continue;
+                    }
+                    BufWriterState::Flush(f) => {
+                        ready!(f.poll_unpin(cx).map_err(std::io::Error::from))?;
+
+                        // After flushing, prepare the next multipart session
+                        let opts = PutMultipartOpts {
+                            attributes: self.attributes.clone().unwrap_or_default(),
+                            tags: self.tags.clone().unwrap_or_default(),
+                            copy_and_append: true,
+                            extensions: self.extensions.take().unwrap_or_default(),
+                        };
+                        let store = Arc::clone(&self.store);
+                        let cap = self.capacity;
+                        let path = self.path.clone();
+
+                        self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
+                            let upload = store.put_multipart_opts(&path, opts).await?;
+                            Ok(WriteMultipart::new_with_chunk_size(upload, cap))
+                        }));
+
+                        // Re-loop to poll the prepare-after-flush future
+                        continue;
+                    }
+                    BufWriterState::PrepareAfterFlush(f) => {
+                        // Finish preparing the next multipart upload after flushing
+                        self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
+                        return Poll::Ready(Ok(()));
+                    }
                 }
-            };
+            }
         }
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             match &mut self.state {
-                BufWriterState::Prepare(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                 }
                 BufWriterState::Buffer(p, b) => {
@@ -445,6 +578,7 @@ impl AsyncWrite for BufWriter {
                     let opts = PutOptions {
                         attributes: self.attributes.take().unwrap_or_default(),
                         tags: self.tags.take().unwrap_or_default(),
+                        copy_and_append: true,
                         ..Default::default()
                     };
                     let store = Arc::clone(&self.store);
@@ -492,6 +626,10 @@ mod tests {
     use crate::{Attribute, GetOptions};
     use itertools::Itertools;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    // THESE IMPORTS ARE ARAS ONLY
+    use std::fs::File;
+    use std::io::Read;
 
     #[tokio::test]
     async fn test_buf_reader() {
@@ -675,5 +813,103 @@ mod tests {
             .unwrap();
         assert_eq!(response.meta.size, 40);
         assert_eq!(response.bytes().await.unwrap(), (0..40).collect_vec());
+    }
+
+    /// THIS TEST IS ARAS ONLY
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_buf_writer_with_append_only_local_file() {
+        let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
+        let cwd = std::env::current_dir().unwrap();
+        let table_path = "target/tests/test1.json";
+        let path = format!("{}/{table_path}", cwd.to_string_lossy());
+        let location = Path::parse(&path).unwrap();
+
+        let buf_writer = BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 3)
+            .with_prepare_after_flush(true);
+        let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
+
+        let bytes = b"abc";
+        writer.write_all(bytes).await.unwrap();
+        let bytes = b"abc";
+        writer.write_all(bytes).await.unwrap();
+        let bytes = b"abc";
+        writer.write_all(bytes).await.unwrap();
+
+        assert!(!std::path::Path::new(&path).exists());
+        writer.flush().await.unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        let contents = read_file_contents(&path).unwrap();
+        assert_eq!(contents, "abcabcabc");
+
+        let buf_writer = BufWriter::new(Arc::clone(&object_store), location.clone())
+            .with_prepare_after_flush(true);
+        let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
+        let bytes = b"def";
+        writer.write_all(bytes).await.unwrap();
+        let bytes = b"def";
+        writer.write_all(bytes).await.unwrap();
+        writer.flush().await.unwrap();
+        let contents = read_file_contents(&path).unwrap();
+        assert_eq!(contents, "abcabcabcdefdef");
+
+        let meta = object_store.head(&location).await.unwrap();
+        let mut reader = BufReader::new(Arc::clone(&object_store), &meta);
+        let mut bytes = Vec::with_capacity(4096);
+        let n = reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(n, 15);
+
+        let buf_writer = BufWriter::new(Arc::clone(&object_store), location.clone())
+            .with_prepare_after_flush(true);
+        let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
+        let bytes = b"zzzz";
+        writer.write_all(bytes).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let contents = read_file_contents(&path).unwrap();
+        assert_eq!(contents, "abcabcabcdefdefzzzz");
+        // Clean up test file
+        if let Err(e) = std::fs::remove_file(&path) {
+            panic!("Failed to delete file {path}: {e}");
+        }
+    }
+
+    /// THIS TEST IS ARAS ONLY
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_values_in_order() {
+        let object_store = Arc::new(crate::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>;
+        let cwd = std::env::current_dir().unwrap();
+        let table_path = "target/tests/test2.json";
+        let path = format!("{}/{table_path}", cwd.to_string_lossy());
+        let location = Path::parse(&path).unwrap();
+
+        let buf_writer =
+            BufWriter::with_capacity(Arc::clone(&object_store), location.clone(), 1024)
+                .with_prepare_after_flush(true);
+        let mut writer = Box::new(buf_writer) as Box<dyn AsyncWrite + Send + Unpin>;
+
+        let bytes = b"1\n2\n3\n";
+        writer.write_all(bytes).await.unwrap();
+        writer.flush().await.unwrap();
+        let bytes = b"4\n5\n";
+        writer.write_all(bytes).await.unwrap();
+        writer.flush().await.unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        let contents = read_file_contents(&path).unwrap();
+        assert_eq!(contents, "1\n2\n3\n4\n5\n");
+
+        writer.shutdown().await.unwrap();
+        // Clean up test file
+        if let Err(e) = std::fs::remove_file(&path) {
+            panic!("Failed to delete file {path}: {e}");
+        }
+    }
+
+    fn read_file_contents(path: &str) -> std::io::Result<String> {
+        let file = File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut contents = String::new();
+        reader.read_to_string(&mut contents)?;
+        Ok(contents)
     }
 }
