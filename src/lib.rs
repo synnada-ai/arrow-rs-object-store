@@ -1168,6 +1168,8 @@ impl From<PutResult> for UpdateVersion {
     }
 }
 
+/// THIS STRUCT IS COMMON, MODIFIED BY ARAS
+///
 /// Options for a put request
 #[derive(Debug, Clone, Default)]
 pub struct PutOptions {
@@ -1187,24 +1189,34 @@ pub struct PutOptions {
     /// These extensions are ignored entirely by backends offered through this crate.
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
-    pub extensions: Extensions,
+    pub extensions: ::http::Extensions,
+    /// THIS FIELD IS ARAS ONLY
+    ///
+    /// Copy file and append to it during checkpointing
+    pub copy_and_append: bool,
 }
 
 impl PartialEq<Self> for PutOptions {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn eq(&self, other: &Self) -> bool {
         let Self {
             mode,
             tags,
             attributes,
             extensions: _,
+            copy_and_append,
         } = self;
         let Self {
             mode: other_mode,
             tags: other_tags,
             attributes: other_attributes,
             extensions: _,
+            copy_and_append: other_copy_and_append,
         } = other;
-        (mode == other_mode) && (tags == other_tags) && (attributes == other_attributes)
+        (mode == other_mode)
+            && (tags == other_tags)
+            && (attributes == other_attributes)
+            && (copy_and_append == other_copy_and_append)
     }
 }
 
@@ -1237,11 +1249,8 @@ impl From<Attributes> for PutOptions {
     }
 }
 
-// See <https://github.com/apache/arrow-rs-object-store/issues/339>.
-#[doc(hidden)]
-#[deprecated(note = "Use PutMultipartOptions", since = "0.12.3")]
-pub type PutMultipartOpts = PutMultipartOptions;
-
+/// THIS STRUCT IS COMMON, MODIFIED BY ARAS
+///
 /// Options for [`ObjectStore::put_multipart_opts`]
 #[derive(Debug, Clone, Default)]
 pub struct PutMultipartOptions {
@@ -1259,22 +1268,31 @@ pub struct PutMultipartOptions {
     /// These extensions are ignored entirely by backends offered through this crate.
     ///
     /// They are also eclused from [`PartialEq`] and [`Eq`].
-    pub extensions: Extensions,
+    pub extensions: ::http::Extensions,
+    /// THIS FIELD IS ARAS ONLY
+    ///
+    /// Copy file and append to it during checkpointing
+    pub copy_and_append: bool,
 }
 
 impl PartialEq<Self> for PutMultipartOptions {
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn eq(&self, other: &Self) -> bool {
         let Self {
             tags,
             attributes,
             extensions: _,
+            copy_and_append,
         } = self;
         let Self {
             tags: other_tags,
             attributes: other_attributes,
             extensions: _,
+            copy_and_append: other_copy_and_append,
         } = other;
-        (tags == other_tags) && (attributes == other_attributes)
+        (tags == other_tags)
+            && (attributes == other_attributes)
+            && (copy_and_append == other_copy_and_append)
     }
 }
 

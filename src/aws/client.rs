@@ -627,6 +627,7 @@ impl S3Client {
             .with_session_creds(false)
     }
 
+    /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     pub(crate) async fn create_multipart(
         &self,
         location: &Path,
@@ -636,6 +637,7 @@ impl S3Client {
             tags,
             attributes,
             extensions,
+            copy_and_append: _copy_and_append,
         } = opts;
 
         let mut request = self.request(Method::POST, location);
