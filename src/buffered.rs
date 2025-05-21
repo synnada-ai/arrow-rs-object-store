@@ -228,9 +228,12 @@ pub struct BufWriter {
     state: BufWriterState,
     store: Arc<dyn ObjectStore>,
     /// THIS FIELD IS ARAS ONLY
+    ///
+    /// The path information is also in BufWriterState, but after its state changes,
+    /// we lose that information. So, we need to keep it explicitly as well.
     path: Path,
     /// THIS FIELD IS ARAS ONLY
-    actual_flush: bool,
+    commit_on_flush: bool,
 }
 
 impl std::fmt::Debug for BufWriter {
@@ -247,7 +250,7 @@ enum BufWriterState {
     Buffer(Path, PutPayloadMut),
     /// [`ObjectStore::put_multipart`]
     Prepare(BoxFuture<'static, crate::Result<WriteMultipart>>),
-    PrepareAfterFlush(BoxFuture<'static, crate::Result<WriteMultipart>>),
+    PrepareAppend(BoxFuture<'static, crate::Result<WriteMultipart>>),
     /// Write to a multipart upload
     Write(Option<WriteMultipart>),
     /// [`ObjectStore::put`]
@@ -273,7 +276,7 @@ impl BufWriter {
             extensions: None,
             state: BufWriterState::Buffer(path.clone(), PutPayloadMut::new()),
             path,
-            actual_flush: false,
+            commit_on_flush: false,
         }
     }
 
@@ -282,7 +285,7 @@ impl BufWriter {
     /// Get the actual flush status
     pub fn with_actual_flush(self, actual_flush: bool) -> Self {
         Self {
-            actual_flush,
+            commit_on_flush: actual_flush,
             ..self
         }
     }
@@ -335,7 +338,7 @@ impl BufWriter {
     /// This API is recommended while the data source generates [`Bytes`].
     pub async fn put(&mut self, bytes: Bytes) -> crate::Result<()> {
         loop {
-            let actual_flush = self.actual_flush;
+            let actual_flush = self.commit_on_flush;
 
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
@@ -352,7 +355,7 @@ impl BufWriter {
                 // make it possible for users to call `put` before `poll_write` returns `Ready`.
                 //
                 // We allow such usage by `await` the future and continue the loop.
-                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAppend(f) => {
                     self.state = BufWriterState::Write(f.await?.into());
                     continue;
                 }
@@ -395,7 +398,7 @@ impl BufWriter {
         match &mut self.state {
             BufWriterState::Buffer(_, _)
             | BufWriterState::Prepare(_)
-            | BufWriterState::PrepareAfterFlush(_) => Ok(()),
+            | BufWriterState::PrepareAppend(_) => Ok(()),
             BufWriterState::Flush(_) => panic!("Already shut down"),
             BufWriterState::Write(x) => x.take().unwrap().abort().await,
         }
@@ -411,7 +414,7 @@ impl AsyncWrite for BufWriter {
     ) -> Poll<Result<usize, Error>> {
         let cap = self.capacity;
         let max_concurrency = self.max_concurrency;
-        let actual_flush = self.actual_flush;
+        let actual_flush = self.commit_on_flush;
         loop {
             return match &mut self.state {
                 BufWriterState::Write(Some(write)) => {
@@ -422,7 +425,7 @@ impl AsyncWrite for BufWriter {
                 BufWriterState::Write(None) | BufWriterState::Flush(_) => {
                     panic!("Already shut down")
                 }
-                BufWriterState::Prepare(f) | BufWriterState::PrepareAfterFlush(f) => {
+                BufWriterState::Prepare(f) | BufWriterState::PrepareAppend(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                     continue;
                 }
@@ -456,7 +459,7 @@ impl AsyncWrite for BufWriter {
 
     /// THIS METHOD IS COMMON, MODIFIED BY ARAS
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        let actual_flush = self.actual_flush;
+        let actual_flush = self.commit_on_flush;
         loop {
             if actual_flush {
                 match &mut self.state {
@@ -483,7 +486,7 @@ impl AsyncWrite for BufWriter {
                             .boxed(),
                         )
                     }
-                    BufWriterState::PrepareAfterFlush(f) => {
+                    BufWriterState::PrepareAppend(f) => {
                         self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                         return Poll::Ready(Ok(()));
                     }
@@ -516,7 +519,7 @@ impl AsyncWrite for BufWriter {
                             let cap = self.capacity;
                             let path = self.path.clone();
 
-                            self.state = BufWriterState::PrepareAfterFlush(Box::pin(async move {
+                            self.state = BufWriterState::PrepareAppend(Box::pin(async move {
                                 let upload = store.put_multipart_opts(&path, opts).await?;
                                 Ok(WriteMultipart::new_with_chunk_size(upload, cap))
                             }));
@@ -531,7 +534,7 @@ impl AsyncWrite for BufWriter {
                         self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                         continue;
                     }
-                    BufWriterState::PrepareAfterFlush(_) => {
+                    BufWriterState::PrepareAppend(_) => {
                         unreachable!(
                             "Not expected to enter PrepareAfterFlush region in normal execution"
                         )
@@ -548,7 +551,7 @@ impl AsyncWrite for BufWriter {
                 BufWriterState::Prepare(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                 }
-                BufWriterState::PrepareAfterFlush(f) => {
+                BufWriterState::PrepareAppend(f) => {
                     self.state = BufWriterState::Write(ready!(f.poll_unpin(cx)?).into());
                 }
                 BufWriterState::Buffer(p, b) => {
